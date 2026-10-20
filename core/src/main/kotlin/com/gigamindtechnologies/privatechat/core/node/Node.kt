@@ -188,7 +188,7 @@ class Node(
     fun start() {
         check(!running) { "Already started" }
         running = true
-        val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
+        val server = ServerSocket(0, 50, LOOPBACK)
         mainServer = server
         scope.launch { acceptLoop(server) }
         scope.launch {
@@ -342,7 +342,7 @@ class Node(
         // A fresh onion address and key just for this code. Nothing in the QR code is reused.
         val inviteOnion = OnionKey.generate()
         val inviteStatic = Dh.generate()
-        val server = ServerSocket(0, 5, InetAddress.getLoopbackAddress())
+        val server = ServerSocket(0, 5, LOOPBACK)
         if (!track(generation, server)) return
         host.publish(inviteOnion, config.virtualPort, server.localPort, emptyList())
         try {
@@ -801,6 +801,12 @@ class Node(
         private val PROLOGUE_CONTACT = "PrivateChat/1 contact".toByteArray()
         private val PROLOGUE_INVITE = "PrivateChat/1 invite".toByteArray()
         private val MESSAGE_ID = Regex("^[0-9a-f]{32}$")
+
+        /**
+         * Tor forwards onion-service connections to 127.0.0.1 (see [TorOnionHost]). This must not be
+         * InetAddress.getLoopbackAddress(), which is ::1 on Android, where nothing would arrive.
+         */
+        val LOOPBACK: InetAddress = InetAddress.getByAddress("localhost", byteArrayOf(127, 0, 0, 1))
 
         private fun compareKeys(a: ByteArray, b: ByteArray): Int {
             for (i in a.indices) {

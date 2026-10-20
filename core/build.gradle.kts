@@ -25,3 +25,8 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
 }
+
+tasks.test {
+    // Behave like Android, where InetAddress.getLoopbackAddress() is ::1 rather than 127.0.0.1.
+    systemProperty("java.net.preferIPv6Addresses", "true")
+}

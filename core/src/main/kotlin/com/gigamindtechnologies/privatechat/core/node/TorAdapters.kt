@@ -10,7 +10,8 @@ import java.net.Socket
 /** [OnionHost] backed by a Tor control connection. */
 class TorOnionHost(private val control: TorControlClient) : OnionHost {
     override fun publish(key: OnionKey, virtualPort: Int, localPort: Int, authorizedClients: List<ByteArray>) {
-        val serviceId = control.addOnion(key.torKeyBlob(), virtualPort, "127.0.0.1:$localPort", authorizedClients)
+        val target = "${Node.LOOPBACK.hostAddress}:$localPort"
+        val serviceId = control.addOnion(key.torKeyBlob(), virtualPort, target, authorizedClients)
         if (serviceId != key.address) {
             runCatching { control.delOnion(serviceId) }
             throw IOException("Tor published an unexpected onion address")

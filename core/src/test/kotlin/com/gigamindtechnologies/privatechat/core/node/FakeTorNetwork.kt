@@ -44,7 +44,8 @@ class FakeTorNetwork {
                 val publicKey = Dh.fromPrivate(key).publicKey
                 if (service.clients.none { it.contentEquals(publicKey) }) throw IOException("Wrong client authorization")
             }
-            return Socket(InetAddress.getLoopbackAddress(), service.localPort)
+            // Like Tor, always forward to 127.0.0.1, so a service listening only on ::1 is unreachable.
+            return Socket(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), service.localPort)
         }
     }
 }

@@ -4,9 +4,10 @@ A private messenger for Android with **no servers, no database and no accounts**
 Messages go directly from one phone to the other through the Tor network, and only while
 both people are online.
 
-> **Status: early prototype (v0.1).** It builds, its tests pass (including over a real Tor
-> network) and it has not been tested on many phones yet. It has **not** had an independent
-> security audit. Do not rely on it where your safety depends on it until it has.
+> **Status: early prototype (v0.1).** Automated tests pass, including over a real Tor network,
+> and the app has been tested end to end on an Android 14 emulator. It has not been tested on
+> real phones yet, and it has **not** had an independent security audit. Do not rely on it where
+> your safety depends on it until it has.
 
 ## How it works
 
@@ -113,6 +114,14 @@ then checks that strangers are refused with Tor's "missing client authorization"
 ```bash
 ./tools/testnet/run-e2e.sh        # needs tor, tor-gencert, python3, git
 ```
+
+**On a device.** The app has been run on an Android 14 emulator, with its built-in Tor connected
+to the private test network through `adb reverse`. That run covered setup, Tor start-up, showing
+a code, the pairing request with matching safety symbols, chatting both ways with delivery
+receipts, and the contact going offline. This found a bug the JVM tests could not: on Android,
+`InetAddress.getLoopbackAddress()` is `::1`, so Tor (which forwards to `127.0.0.1`) could not
+reach the app. The engine now binds to `127.0.0.1` explicitly, and `core` tests run with
+`java.net.preferIPv6Addresses=true` to catch this on machines with IPv6.
 
 ## Roadmap ideas
 
