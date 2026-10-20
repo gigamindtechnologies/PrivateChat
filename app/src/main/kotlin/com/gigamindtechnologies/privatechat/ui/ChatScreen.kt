@@ -33,7 +33,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +47,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.gigamindtechnologies.privatechat.AppGraph
 import com.gigamindtechnologies.privatechat.R
@@ -67,10 +67,11 @@ import java.util.Date
 @Composable
 fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Unit) {
     val context = LocalContext.current
-    DisposableEffect(contactId) {
+    // Only while the app is in front: in the background, new messages should still notify.
+    LifecycleResumeEffect(contactId) {
         graph.visibleChatId = contactId
         Notifications.clearMessages(context)
-        onDispose { if (graph.visibleChatId == contactId) graph.visibleChatId = null }
+        onPauseOrDispose { if (graph.visibleChatId == contactId) graph.visibleChatId = null }
     }
 
     val contact: Contact?

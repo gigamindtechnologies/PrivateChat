@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -64,7 +65,8 @@ class ChatService : Service() {
 
     private suspend fun run() {
         val graph = graph
-        val identity = (graph.identity.value as? IdentityState.Ready)?.identity ?: run {
+        // After Android restarts the service, the identity may still be loading from storage.
+        val identity = (graph.identity.first { it != IdentityState.Loading } as? IdentityState.Ready)?.identity ?: run {
             stopSelf()
             return
         }
