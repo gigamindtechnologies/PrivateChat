@@ -1,0 +1,6 @@
+# chutney network: 4 directory authorities + 4 relays on 127.0.0.1.
+# The end-to-end test starts its own three Tor clients (Alice, Bob, Mallory) on top of it.
+Authority = Node(tag="a", authority=1, relay=1)
+NonExitRelay = Node(tag="r", relay=1)
+NODES = Authority.getN(4) + NonExitRelay.getN(4)
+ConfigureNodes(NODES)
