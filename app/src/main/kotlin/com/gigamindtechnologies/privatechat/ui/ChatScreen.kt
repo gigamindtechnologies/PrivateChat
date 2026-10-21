@@ -2,15 +2,17 @@
 
 package com.gigamindtechnologies.privatechat.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -26,14 +28,13 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -47,7 +48,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.gigamindtechnologies.privatechat.AppGraph
 import com.gigamindtechnologies.privatechat.R
@@ -98,9 +101,17 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
     }
     val online = node?.online?.collectAsStateWithLifecycle()?.value?.contains(contactId) == true
     val name = contact?.name ?: ""
+    val showReadTicks by graph.readReceipts.collectAsStateWithLifecycle()
+
+    // Their messages count as read while this chat is on screen (not when the app is in the background).
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsState()
+    val resumed = lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+    val unread = messages.count { !it.outgoing && it.status == MessageStatus.RECEIVED }
+    LaunchedEffect(node, resumed, unread) {
+        if (node != null && resumed && unread > 0) node.markRead(contactId)
+    }
 
     val scope = rememberCoroutineScope()
-    val snackbar = remember { SnackbarHostState() }
     var text by rememberSaveable { mutableStateOf("") }
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
@@ -133,12 +144,15 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
                 },
             )
         },
-        snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
                 if (!online) {
                     Text(
-                        if (node == null) "Connecting to Tor…" else "$name is offline. Messages can only be sent while you're both online.",
+                        if (node == null) {
+                            "Connecting to Tor…"
+                        } else {
+                            "$name is offline. Your messages wait on this phone (🕓) and are sent as soon as $name is online."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
@@ -154,14 +168,13 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
                         modifier = Modifier.weight(1f),
                     )
                     IconButton(
-                        enabled = online && text.isNotBlank(),
+                        enabled = node != null && text.isNotBlank(),
                         onClick = {
                             val toSend = text
                             scope.launch {
-                                when (node?.sendText(contactId, toSend)) {
-                                    Node.SendResult.SENT -> if (text == toSend) text = ""
-                                    Node.SendResult.OFFLINE -> snackbar.showSnackbar("$name just went offline")
-                                    else -> Unit
+                                val result = node?.sendText(contactId, toSend)
+                                if (result == Node.SendResult.SENT || result == Node.SendResult.QUEUED) {
+                                    if (text == toSend) text = ""
                                 }
                             }
                         },
@@ -179,13 +192,7 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
             contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
         ) {
             items(messages.asReversed(), key = { (if (it.outgoing) "out-" else "in-") + it.id }) { message ->
-                MessageBubble(message, onRetry = {
-                    scope.launch {
-                        if (node?.retry(contactId, message.id) == Node.SendResult.OFFLINE) {
-                            snackbar.showSnackbar("$name is offline")
-                        }
-                    }
-                })
+                MessageBubble(message, showReadTicks)
             }
             if (messages.isEmpty()) {
                 item {
@@ -234,9 +241,8 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage, onRetry: () -> Unit) {
+private fun MessageBubble(message: ChatMessage, showReadTicks: Boolean) {
     val outgoing = message.outgoing
-    val failed = message.status == MessageStatus.FAILED
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start) {
         Surface(
             color = if (outgoing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
@@ -246,26 +252,46 @@ private fun MessageBubble(message: ChatMessage, onRetry: () -> Unit) {
                 bottomStart = if (outgoing) 16.dp else 4.dp,
                 bottomEnd = if (outgoing) 4.dp else 16.dp,
             ),
-            modifier = Modifier.widthIn(max = 300.dp).then(if (failed) Modifier.clickable(onClick = onRetry) else Modifier),
+            modifier = Modifier.widthIn(max = 300.dp),
         ) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Text(message.body)
-                val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(message.timestamp))
-                val status = when (message.status) {
-                    MessageStatus.SENDING -> " · Sending…"
-                    MessageStatus.DELIVERED -> " · ✓ Delivered"
-                    MessageStatus.FAILED -> " · Not delivered — tap to retry"
-                    MessageStatus.RECEIVED -> ""
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
+                ) {
+                    Text(
+                        DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(message.timestamp)),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (outgoing) {
+                        Spacer(Modifier.width(4.dp))
+                        Ticks(message.status, showReadTicks)
+                    }
                 }
-                Text(
-                    time + status,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
             }
         }
     }
+}
+
+/**
+ * 🕓 waiting on this phone · ✓ sent · ✓✓ delivered to their phone · green ✓✓ read.
+ * With read receipts off, we don't show theirs either (like WhatsApp).
+ */
+@Composable
+private fun Ticks(status: MessageStatus, showReadTicks: Boolean) {
+    val grey = MaterialTheme.colorScheme.onSurfaceVariant
+    val (icon, tint, label) = when (status) {
+        MessageStatus.SENDING, MessageStatus.FAILED -> Triple(R.drawable.ic_tick_clock, grey, "Waiting to send")
+        MessageStatus.SENT -> Triple(R.drawable.ic_tick_single, grey, "Sent")
+        MessageStatus.DELIVERED -> Triple(R.drawable.ic_tick_double, grey, "Delivered")
+        MessageStatus.READ ->
+            if (showReadTicks) Triple(R.drawable.ic_tick_double, ReadGreen, "Read")
+            else Triple(R.drawable.ic_tick_double, grey, "Delivered")
+        MessageStatus.RECEIVED -> return
+    }
+    Icon(painterResource(icon), contentDescription = label, tint = tint, modifier = Modifier.size(16.dp))
 }
 
 @Composable

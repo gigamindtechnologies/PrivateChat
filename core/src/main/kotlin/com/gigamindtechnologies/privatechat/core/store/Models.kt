@@ -64,8 +64,22 @@ data class Contact(
     }
 }
 
+/**
+ * Outgoing: [SENDING] (waiting on this phone) → [SENT] (handed to their phone) → [DELIVERED]
+ * (their phone saved it) → [READ] (they opened the chat).
+ * Incoming: [RECEIVED] → [READ] (we opened the chat).
+ */
 @Serializable
-enum class MessageStatus { SENDING, DELIVERED, FAILED, RECEIVED }
+enum class MessageStatus {
+    SENDING,
+    SENT,
+    DELIVERED,
+    READ,
+
+    /** Written by older versions; treated as [SENDING] and sent again automatically. */
+    FAILED,
+    RECEIVED,
+}
 
 @Serializable
 data class ChatMessage(

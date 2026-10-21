@@ -90,6 +90,7 @@ fun HomeScreen(
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             TorBanner(tor, onRetryTor)
+            BackgroundAccessBanner()
             if (contacts.isEmpty()) {
                 EmptyContacts()
             } else {

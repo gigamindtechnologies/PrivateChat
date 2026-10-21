@@ -30,6 +30,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,10 +43,13 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.gigamindtechnologies.privatechat.R
 import com.gigamindtechnologies.privatechat.TorStatus
+import com.gigamindtechnologies.privatechat.service.BackgroundAccess
 
 val OnlineGreen = Color(0xFF2E7D32)
+val ReadGreen = Color(0xFF1FAF5A)
 
 @Composable
 fun BackTopBar(title: String, onBack: () -> Unit, actions: @Composable () -> Unit = {}) {
@@ -92,6 +99,29 @@ fun TorBanner(tor: TorStatus, onRetry: () -> Unit) {
         }
         TorStatus.Failed -> Banner("Couldn't connect to Tor. Check your internet connection.", "Retry", onRetry)
         TorStatus.Stopped -> Banner("You're offline. Nobody can reach you.", "Go online", onRetry)
+    }
+}
+
+/** Shown until PrivateChat may run in the background; without that, messages stop when the app is closed. */
+@Composable
+fun BackgroundAccessBanner() {
+    val context = LocalContext.current
+    var unrestricted by remember { mutableStateOf(BackgroundAccess.isUnrestricted(context)) }
+    LifecycleResumeEffect(Unit) {
+        unrestricted = BackgroundAccess.isUnrestricted(context)
+        onPauseOrDispose {}
+    }
+    if (unrestricted) return
+    Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Allow PrivateChat to run in the background, or messages stop when the app is closed.",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            TextButton(onClick = { BackgroundAccess.request(context) }) { Text("Allow") }
+        }
     }
 }
 

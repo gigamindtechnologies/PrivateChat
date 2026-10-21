@@ -110,7 +110,7 @@ class NodeTest {
     }
 
     @Test
-    fun messagesOnlyGoWhileTheOtherPhoneIsOnlineAndHistoryIsKept() {
+    fun messagesWaitOnThePhoneUntilTheContactComesOnline() {
         val alice = phone("Alice")
         val bob = phone("Bob")
         pair(alice, bob)
@@ -121,15 +121,80 @@ class NodeTest {
 
         alice.node.stop()
         await("offline") { bob.node.online.value.takeIf { it.isEmpty() } }
-        assertEquals(Node.SendResult.OFFLINE, runBlocking { bob.node.sendText(aliceId, "while offline") })
+        // No server: the message waits on Bob's phone (the clock icon).
+        assertEquals(Node.SendResult.QUEUED, runBlocking { bob.node.sendText(aliceId, "while you were away") })
+        val queued = bob.node.messages(aliceId).value.single { it.body == "while you were away" }
+        assertEquals(MessageStatus.SENDING, queued.status)
 
-        // Alice opens the app again: contacts and history come back from the encrypted files.
+        // Alice opens the app again: history comes back from the encrypted files, and the
+        // waiting message is delivered automatically.
         val alice2 = phone("Alice", store = alice.store)
         val bobId = alice2.node.contacts.value.single().id
-        assertEquals("before", alice2.node.messages(bobId).value.single().body)
-        await("reconnected") { bob.node.online.value.takeIf { aliceId in it } }
-        assertEquals(Node.SendResult.SENT, runBlocking { bob.node.sendText(aliceId, "after") })
-        await("after") { alice2.node.messages(bobId).value.find { it.body == "after" } }
+        await("queued message arrives") { alice2.node.messages(bobId).value.find { it.body == "while you were away" } }
+        await("bob sees delivered") {
+            bob.node.messages(aliceId).value.single { it.id == queued.id }.takeIf { it.status == MessageStatus.DELIVERED }
+        }
+        assertEquals(listOf("before", "while you were away"), alice2.node.messages(bobId).value.map { it.body })
+    }
+
+    @Test
+    fun ticksGoFromDeliveredToReadWhenTheChatIsOpened() {
+        val alice = phone("Alice")
+        val bob = phone("Bob")
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.node.online.value.takeIf { aliceId in it } }
+
+        assertEquals(Node.SendResult.SENT, runBlocking { bob.node.sendText(aliceId, "hi") })
+        val sent = await("delivered") { bob.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.DELIVERED } }
+        assertEquals(MessageStatus.RECEIVED, alice.node.messages(bobId).value.single().status)
+
+        runBlocking { alice.node.markRead(bobId) }
+        assertEquals(MessageStatus.READ, alice.node.messages(bobId).value.single().status)
+        await("green ticks") { bob.node.messages(aliceId).value.single { it.id == sent.id }.takeIf { it.status == MessageStatus.READ } }
+    }
+
+    @Test
+    fun readReceiptsCanBeTurnedOff() {
+        val alice = phone("Alice")
+        val bob = phone("Bob")
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.node.online.value.takeIf { aliceId in it } }
+        alice.node.sendReadReceipts = false
+
+        runBlocking { bob.node.sendText(aliceId, "did you read this?") }
+        await("delivered") { bob.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.DELIVERED } }
+        runBlocking { alice.node.markRead(bobId) }
+        assertEquals(MessageStatus.READ, alice.node.messages(bobId).value.single().status)
+        // Give a receipt time to arrive if one had been (wrongly) sent.
+        runBlocking { bob.node.sendText(aliceId, "ping") }
+        await("second delivered") { bob.node.messages(aliceId).value.last().takeIf { it.status == MessageStatus.DELIVERED } }
+        Thread.sleep(300)
+        assertEquals(MessageStatus.DELIVERED, bob.node.messages(aliceId).value.first().status)
+    }
+
+    @Test
+    fun readReceiptsReachTheSenderAfterTheyReconnect() {
+        val alice = phone("Alice")
+        val bob = phone("Bob")
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.node.online.value.takeIf { aliceId in it } }
+        runBlocking { bob.node.sendText(aliceId, "read me later") }
+        await("delivered") { bob.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.DELIVERED } }
+
+        bob.node.stop()
+        await("bob offline") { alice.node.online.value.takeIf { it.isEmpty() } }
+        runBlocking { alice.node.markRead(bobId) } // Bob is offline: the receipt has to wait
+
+        val bob2 = phone("Bob", store = bob.store)
+        await("green ticks after reconnect") {
+            bob2.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.READ }
+        }
     }
 
     @Test

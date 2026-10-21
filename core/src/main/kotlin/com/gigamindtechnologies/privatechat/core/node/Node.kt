@@ -80,6 +80,8 @@ class Node(
     private val dialer: Dialer,
     private val config: Config = Config(),
     private val log: (String, Throwable?) -> Unit = { _, _ -> },
+    /** Asks the platform to keep the CPU awake for the given milliseconds while work finishes. */
+    private val wake: (Long) -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     data class Config(
@@ -115,7 +117,12 @@ class Node(
 
     enum class FailReason { INVALID_CODE, UNREACHABLE, REJECTED, EXPIRED, ERROR }
 
-    enum class SendResult { SENT, OFFLINE, INVALID }
+    /** [QUEUED]: they are offline; the message waits on this phone and goes out when they connect. */
+    enum class SendResult { SENT, QUEUED, INVALID }
+
+    /** Whether we tell contacts when we have read their messages. */
+    @Volatile
+    var sendReadReceipts: Boolean = true
 
     private val scope = CoroutineScope(
         SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e -> log("Unexpected error", e) },
@@ -227,21 +234,31 @@ class Node(
         if (body.isEmpty() || body.length > Wire.MAX_TEXT_LENGTH || contact(contactId) == null) {
             return@withContext SendResult.INVALID
         }
-        val session = synchronized(sessionsLock) { sessions[contactId] } ?: return@withContext SendResult.OFFLINE
         val message = ChatMessage(newMessageId(), contactId, true, body, clock(), MessageStatus.SENDING)
         if (!appendMessage(message)) return@withContext SendResult.INVALID
+        val session = synchronized(sessionsLock) { sessions[contactId] }
+        if (session == null) {
+            // Try to reach them now; if they are offline it goes out as soon as they connect.
+            retries.remove(contactId)
+            wakeUp.trySend(Unit)
+            return@withContext SendResult.QUEUED
+        }
         transmit(session, message)
         SendResult.SENT
     }
 
-    suspend fun retry(contactId: String, messageId: String): SendResult = withContext(Dispatchers.IO) {
-        val message = conversation(contactId).value.find {
-            it.id == messageId && it.outgoing && it.status == MessageStatus.FAILED
-        } ?: return@withContext SendResult.INVALID
-        val session = synchronized(sessionsLock) { sessions[contactId] } ?: return@withContext SendResult.OFFLINE
-        setStatus(contactId, messageId, true, MessageStatus.SENDING)
-        transmit(session, message.copy(status = MessageStatus.SENDING))
-        SendResult.SENT
+    /** Marks their messages as read (the chat is on screen) and tells them, if read receipts are on. */
+    suspend fun markRead(contactId: String) = withContext(Dispatchers.IO) {
+        val conversation = conversation(contactId)
+        val unread = synchronized(conversation) {
+            conversation.value.filter { !it.outgoing && it.status == MessageStatus.RECEIVED }.map { it.id }
+        }
+        if (unread.isEmpty()) return@withContext
+        unread.forEach { setStatus(contactId, it, false, MessageStatus.READ) }
+        if (sendReadReceipts) {
+            val session = synchronized(sessionsLock) { sessions[contactId] }
+            runCatching { session?.send(Wire.Read(unread.takeLast(Wire.MAX_READ_IDS))) }
+        }
     }
 
     suspend fun renameContact(contactId: String, name: String) = withContext(Dispatchers.IO) {
@@ -649,7 +666,21 @@ class Node(
         retries.remove(contactId)
         replaced?.channel?.close() // its unacknowledged messages move to the new session
         publishOnline()
+        wake(15_000)
         scope.launch { runSession(session) }
+        scope.launch { catchUp(session) }
+    }
+
+    /** On every new connection: send what waited while they were offline, and our read receipts. */
+    private fun catchUp(session: Session) {
+        val messages = conversation(session.contactId).value
+        messages.filter { it.outgoing && it.status == MessageStatus.SENDING }
+            .sortedBy { it.timestamp }
+            .forEach { transmit(session, it) }
+        if (sendReadReceipts) {
+            val read = messages.filter { !it.outgoing && it.status == MessageStatus.READ }.takeLast(Wire.MAX_READ_IDS)
+            if (read.isNotEmpty()) runCatching { session.send(Wire.Read(read.map { it.id })) }
+        }
     }
 
     private suspend fun runSession(session: Session) = coroutineScope {
@@ -688,6 +719,10 @@ class Node(
                 synchronized(session) { session.unacked.remove(message.id) }
                 setStatus(session.contactId, message.id, true, MessageStatus.DELIVERED)
             }
+            is Wire.Read -> message.ids.take(Wire.MAX_READ_IDS).filter { MESSAGE_ID.matches(it) }.forEach { id ->
+                synchronized(session) { session.unacked.remove(id) }
+                setStatus(session.contactId, id, true, MessageStatus.READ)
+            }
             Wire.Ping -> session.send(Wire.Pong)
             Wire.Pong -> Unit
             Wire.Unpair -> {
@@ -709,7 +744,10 @@ class Node(
         val added = synchronized(conversation) {
             conversation.value.none { it.id == text.id && !it.outgoing } && appendMessage(message)
         }
-        if (added) _incoming.tryEmit(message)
+        if (added) {
+            wake(10_000) // long enough to save it and show the notification
+            _incoming.tryEmit(message)
+        }
         session.send(Wire.Ack(text.id))
     }
 
@@ -723,11 +761,12 @@ class Node(
         if (!queued) {
             val current = synchronized(sessionsLock) { sessions[message.contactId] }
             if (current != null && current !== session) transmit(current, message)
-            else setStatus(message.contactId, message.id, true, MessageStatus.FAILED)
+            else requeue(message) // waits for their next connection
             return
         }
         try {
             session.send(Wire.Text(message.id, message.body, message.timestamp))
+            setStatus(message.contactId, message.id, true, MessageStatus.SENT)
         } catch (e: IOException) {
             session.channel.close() // sessionEnded() decides what happens to the message
         }
@@ -744,8 +783,7 @@ class Node(
             session.unacked.values.toList().also { session.unacked.clear() }
         }
         for (message in pending) {
-            if (current != null) transmit(current, message)
-            else setStatus(message.contactId, message.id, true, MessageStatus.FAILED)
+            if (current != null) transmit(current, message) else requeue(message)
         }
         // They may just have switched networks: try again soon instead of waiting for backoff.
         if (current == null && running) retries[session.contactId] = Retry(clock() + config.retryMinMs / 4, 0)
@@ -763,10 +801,15 @@ class Node(
 
     private fun conversation(contactId: String): MutableStateFlow<List<ChatMessage>> =
         conversations.computeIfAbsent(contactId) {
-            // A message still "sending" when the app last stopped never got a delivery receipt.
+            // Anything not confirmed delivered goes out again on the next connection; the
+            // receiver ignores duplicates.
             MutableStateFlow(
                 store.loadMessages(contactId).map {
-                    if (it.status == MessageStatus.SENDING) it.copy(status = MessageStatus.FAILED) else it
+                    if (it.outgoing && (it.status == MessageStatus.SENT || it.status == MessageStatus.FAILED)) {
+                        it.copy(status = MessageStatus.SENDING)
+                    } else {
+                        it
+                    }
                 },
             )
         }
@@ -781,13 +824,19 @@ class Node(
         return true
     }
 
-    private fun setStatus(contactId: String, id: String, outgoing: Boolean, status: MessageStatus) {
+    /** A sent message whose connection dropped before their receipt came back: show the clock again. */
+    private fun requeue(message: ChatMessage) =
+        setStatus(message.contactId, message.id, true, MessageStatus.SENDING, requeue = true)
+
+    /** Statuses only move forward (sending → sent → delivered → read), except for [requeue]. */
+    private fun setStatus(contactId: String, id: String, outgoing: Boolean, status: MessageStatus, requeue: Boolean = false) {
         if (contact(contactId) == null) return
         val conversation = conversation(contactId)
         synchronized(conversation) {
             val current = conversation.value.find { it.id == id && it.outgoing == outgoing } ?: return
             if (current.status == status) return
-            if (current.status == MessageStatus.DELIVERED && status == MessageStatus.FAILED) return
+            val allowed = if (requeue) current.status == MessageStatus.SENT else rank(status) > rank(current.status)
+            if (!allowed) return
             store.updateStatus(contactId, id, outgoing, status)
             conversation.update { list ->
                 list.map { if (it.id == id && it.outgoing == outgoing) it.copy(status = status) else it }
@@ -807,6 +856,13 @@ class Node(
          * InetAddress.getLoopbackAddress(), which is ::1 on Android, where nothing would arrive.
          */
         val LOOPBACK: InetAddress = InetAddress.getByAddress("localhost", byteArrayOf(127, 0, 0, 1))
+
+        private fun rank(status: MessageStatus) = when (status) {
+            MessageStatus.SENDING, MessageStatus.FAILED, MessageStatus.RECEIVED -> 0
+            MessageStatus.SENT -> 1
+            MessageStatus.DELIVERED -> 2
+            MessageStatus.READ -> 3
+        }
 
         private fun compareKeys(a: ByteArray, b: ByteArray): Int {
             for (i in a.indices) {

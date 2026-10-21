@@ -32,11 +32,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.core.net.toUri
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.gigamindtechnologies.privatechat.AppGraph
 import com.gigamindtechnologies.privatechat.IdentityState
 import com.gigamindtechnologies.privatechat.TorStatus
 import com.gigamindtechnologies.privatechat.core.node.Node
+import com.gigamindtechnologies.privatechat.service.BackgroundAccess
 import kotlinx.coroutines.launch
 
 @Composable
@@ -82,14 +85,49 @@ fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> U
                         "Go offline and nobody can reach you or see that you exist.",
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+
+            Section("Background") {
+                var unrestricted by remember { mutableStateOf(BackgroundAccess.isUnrestricted(context)) }
+                LifecycleResumeEffect(Unit) {
+                    unrestricted = BackgroundAccess.isUnrestricted(context)
+                    onPauseOrDispose {}
+                }
+                if (unrestricted) {
+                    Text("✓ Allowed to run in the background", style = MaterialTheme.typography.titleMedium, color = OnlineGreen)
+                } else {
+                    Text(
+                        "Not allowed to run in the background. Messages stop arriving when the app is closed.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Button(onClick = { BackgroundAccess.request(context) }) { Text("Allow background") }
+                }
+                Text(
+                    "There is no server to wake the app up, so it keeps its own connection open. " +
+                        "On Xiaomi, Redmi, Poco, Oppo, Realme, Vivo, OnePlus and some Samsung phones, also turn on " +
+                        "\"Autostart\" / \"Allow background activity\" for PrivateChat in the phone's own settings.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 OutlinedButton(onClick = {
                     try {
-                        context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                        context.startActivity(
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri()),
+                        )
                     } catch (_: ActivityNotFoundException) {
                     }
-                }) { Text("Battery settings") }
+                }) { Text("Open app settings") }
+            }
+
+            Section("Privacy") {
+                val readReceipts by graph.readReceipts.collectAsStateWithLifecycle()
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Read receipts", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Switch(checked = readReceipts, onCheckedChange = graph::setReadReceipts)
+                }
                 Text(
-                    "If messages only arrive while the app is open, let PrivateChat run without battery restrictions.",
+                    "When on, contacts see green ticks when you read their messages. " +
+                        "When off, they don't, and you won't see theirs either.",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }

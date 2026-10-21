@@ -1,8 +1,8 @@
 # PrivateChat
 
 A private messenger for Android with **no servers, no database and no accounts**.
-Messages go directly from one phone to the other through the Tor network, and only while
-both people are online.
+Messages go directly from one phone to the other through the Tor network. A message written
+while your friend is offline waits on *your* phone and goes out as soon as they are online.
 
 > **Status: early prototype (v0.1).** Automated tests pass, including over a real Tor network,
 > and the app has been tested end to end on an Android 14 emulator. It has not been tested on
@@ -16,8 +16,11 @@ both people are online.
 2. **Add someone in person.** One person taps **Show my code**, the other taps **Scan a code**.
    Both screens then show the same 5 symbols (for example 🦊 🍕 🚀 🌙 🔑). If they match, the
    person showing the code taps **They match**. This is the only way to add a contact.
-3. **Chat while you are both online.** Messages travel phone → Tor → phone. If the other
-   person is offline, you cannot send. Nothing waits on a server, because there is no server.
+3. **Chat.** Messages travel phone → Tor → phone. If the other person is offline, the message
+   waits on your phone and is sent automatically when they come online. Nothing waits on a
+   server, because there is no server.
+4. **Ticks, like WhatsApp:** 🕓 waiting on your phone · ✓ sent · ✓✓ delivered to their phone ·
+   green ✓✓ read. Read receipts can be turned off in Settings (then you don't see theirs either).
 
 ## Privacy features
 
@@ -42,13 +45,16 @@ both people are online.
 
 ## Things to know (honest limitations)
 
-- **Both people must be online** at the same time to send a message. This is by design: there is
-  no server to hold messages.
+- **Both phones must be online at the same time for a message to arrive.** Until then it waits
+  on the sender's phone (🕓). There is no server to hold messages, by design.
 - **The app keeps a connection open** (you will see a "PrivateChat is online" notification) so
   contacts can reach you. This uses some battery and data. Turn it off in Settings → Connection
   to become unreachable.
-- **Some phones stop background apps.** If messages only arrive while the app is open, use
-  Settings → Battery settings and remove PrivateChat's battery restriction.
+- **Allow background activity.** The app asks once to "run in the background" (Android's battery
+  optimization exemption). Without it, Android cuts the app off the network when it is closed and
+  messages stop arriving. On Xiaomi, Oppo, Realme, Vivo, OnePlus and some Samsung phones, also turn
+  on "Autostart" for PrivateChat in the phone's own settings. The app restarts by itself after the
+  phone reboots, and reconnects as soon as the internet comes back.
 - **Connecting takes a few seconds.** Tor starts in about 10–30 seconds, and pairing usually
   takes 10–60 seconds.
 - **Android only for now.** iPhones don't allow apps to stay reachable in the background.

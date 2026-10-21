@@ -15,6 +15,11 @@ sealed class Wire {
     @SerialName("ack")
     data class Ack(val id: String) : Wire()
 
+    /** "I have read these messages of yours." Only sent if read receipts are on. */
+    @Serializable
+    @SerialName("read")
+    data class Read(val ids: List<String>) : Wire()
+
     @Serializable
     @SerialName("ping")
     data object Ping : Wire()
@@ -48,6 +53,7 @@ sealed class Wire {
     companion object {
         const val MAX_TEXT_LENGTH = 4000
         const val MAX_NAME_LENGTH = 40
+        const val MAX_READ_IDS = 100
 
         private val json = Json {
             classDiscriminator = "t"

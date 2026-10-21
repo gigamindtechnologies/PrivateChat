@@ -3,8 +3,11 @@ package com.gigamindtechnologies.privatechat.service
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.ServiceCompat
 import com.gigamindtechnologies.privatechat.IdentityState
 import com.gigamindtechnologies.privatechat.TorStatus
@@ -30,7 +33,26 @@ class ChatService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var tor: TorRuntime
     private var control: TorControlClient? = null
+    @Volatile
     private var node: Node? = null
+
+    /**
+     * Held only for a few seconds at a time (while a message is saved and shown), never
+     * permanently: a permanent wake lock would drain the battery.
+     */
+    private val wakeLock by lazy {
+        getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrivateChat:message")
+            .apply { setReferenceCounted(false) }
+    }
+
+    /** When the phone gets a network again (Wi-Fi, mobile data), reconnect at once instead of waiting. */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            node?.refreshNow()
+        }
+    }
+    private var networkCallbackRegistered = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -51,6 +73,9 @@ class ChatService : Service() {
             stopSelf()
             return
         }
+        networkCallbackRegistered = runCatching {
+            getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback)
+        }.isSuccess
         scope.launch { run() }
     }
 
@@ -81,7 +106,11 @@ class ChatService : Service() {
                     host = TorOnionHost(control),
                     dialer = TorDialer(control.socksPort()),
                     log = { message, error -> graph.log(message, error) },
-                ).also { it.start() }
+                    wake = { millis -> runCatching { wakeLock.acquire(millis) } },
+                ).also {
+                    it.sendReadReceipts = graph.readReceipts.value
+                    it.start()
+                }
             }
             this.node = node
             graph.node.value = node
@@ -98,6 +127,10 @@ class ChatService : Service() {
     }
 
     override fun onDestroy() {
+        if (networkCallbackRegistered) {
+            runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
+        }
+        runCatching { if (wakeLock.isHeld) wakeLock.release() }
         val graph = graph
         graph.node.value = null
         graph.tor.value = TorStatus.Stopped

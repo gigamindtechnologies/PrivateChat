@@ -1,11 +1,13 @@
 package com.gigamindtechnologies.privatechat
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import com.gigamindtechnologies.privatechat.core.node.Node
 import com.gigamindtechnologies.privatechat.core.protocol.sanitizeName
 import com.gigamindtechnologies.privatechat.core.store.Identity
@@ -57,8 +59,14 @@ class AppGraph(private val app: Application) {
     private val _identity = MutableStateFlow<IdentityState>(IdentityState.Loading)
     val identity: StateFlow<IdentityState> = _identity.asStateFlow()
 
-    /** False after the user chose "Go offline"; opening the app then doesn't reconnect by itself. */
-    val wantsOnline = MutableStateFlow(true)
+    /** Small, non-secret preferences. Excluded from backups like everything else. */
+    private val prefs = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
+
+    /** False after the user chose "Go offline"; the app then doesn't reconnect by itself (not even after a reboot). */
+    val wantsOnline = MutableStateFlow(prefs.getBoolean(PREF_ONLINE, true))
+
+    /** Whether contacts see green ticks when we read their messages. Off also hides theirs, like WhatsApp. */
+    val readReceipts = MutableStateFlow(prefs.getBoolean(PREF_READ_RECEIPTS, true))
 
     /** The running engine, or null while Tor is starting or the app is offline. */
     val node = MutableStateFlow<Node?>(null)
@@ -87,14 +95,28 @@ class AppGraph(private val app: Application) {
         _identity.value = IdentityState.Ready(identity)
     }
 
+    /** True once an identity has been created (checked without touching the Keystore). */
+    fun hasIdentity(): Boolean = File(vaultDir, "identity.bin").exists()
+
     fun goOnline() {
-        wantsOnline.value = true
+        setWantsOnline(true)
         ContextCompat.startForegroundService(app, Intent(app, ChatService::class.java))
     }
 
     fun goOffline() {
-        wantsOnline.value = false
+        setWantsOnline(false)
         app.stopService(Intent(app, ChatService::class.java))
+    }
+
+    fun setReadReceipts(enabled: Boolean) {
+        prefs.edit { putBoolean(PREF_READ_RECEIPTS, enabled) }
+        readReceipts.value = enabled
+        node.value?.sendReadReceipts = enabled
+    }
+
+    private fun setWantsOnline(online: Boolean) {
+        prefs.edit { putBoolean(PREF_ONLINE, online) }
+        wantsOnline.value = online
     }
 
     /** Destroys the identity, contacts, messages, Tor state and the encryption key. */
@@ -111,8 +133,15 @@ class AppGraph(private val app: Application) {
             File(app.dataDir, "app_TorService").deleteRecursively()
             NotificationManagerCompat.from(app).cancelAll()
         }
+        prefs.edit { clear() }
+        readReceipts.value = true
         _identity.value = IdentityState.Missing
         wantsOnline.value = true
+    }
+
+    private companion object {
+        const val PREF_ONLINE = "online"
+        const val PREF_READ_RECEIPTS = "read_receipts"
     }
 
     /** Logs only in debug builds, and never message contents, names or addresses. */
