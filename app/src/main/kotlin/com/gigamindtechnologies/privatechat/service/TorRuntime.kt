@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.IBinder
+import android.os.SystemClock
 import com.gigamindtechnologies.privatechat.core.tor.TorControlClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -28,6 +29,9 @@ class TorRuntime(private val context: Context) {
 
     /** Starts Tor and returns a control connection once Tor has finished bootstrapping. */
     suspend fun start(onProgress: (Int) -> Unit): TorControlClient {
+        // Only one Tor can run in the app. If the previous one was just stopped, let it exit first.
+        val sinceStop = SystemClock.elapsedRealtime() - lastStoppedAt
+        if (lastStoppedAt > 0 && sinceStop < RESTART_GAP_MS) delay(RESTART_GAP_MS - sinceStop)
         withContext(Dispatchers.Main) {
             bound = context.bindService(Intent(context, TorService::class.java), connection, Context.BIND_AUTO_CREATE)
         }
@@ -54,7 +58,15 @@ class TorRuntime(private val context: Context) {
         if (bound) {
             runCatching { context.unbindService(connection) }
             bound = false
+            lastStoppedAt = SystemClock.elapsedRealtime()
         }
+    }
+
+    private companion object {
+        const val RESTART_GAP_MS = 5_000L
+
+        @Volatile
+        var lastStoppedAt = 0L
     }
 
     private suspend fun connect(socketFile: File): TorControlClient {

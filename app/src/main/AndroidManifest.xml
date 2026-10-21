@@ -44,6 +44,10 @@
             android:foregroundServiceType="remoteMessaging" />
 
         <receiver
+            android:name=".service.Heartbeat$Receiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".service.BootReceiver"
             android:exported="false">
             <intent-filter>

@@ -79,6 +79,9 @@ enum class MessageStatus {
     /** Written by older versions; treated as [SENDING] and sent again automatically. */
     FAILED,
     RECEIVED,
+
+    /** Incoming, read while read receipts were off. Never reported, even if receipts are turned on later. */
+    SEEN,
 }
 
 @Serializable

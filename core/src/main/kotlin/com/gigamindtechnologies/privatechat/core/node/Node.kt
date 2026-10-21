@@ -98,6 +98,11 @@ class Node(
         val handshakeTimeoutMs: Int = 120_000,
         val maxConcurrentDials: Int = 8,
         val unpairFlushMs: Long = 1_000,
+        /**
+         * A connection the contact opened replaces our existing one if that is at least this old:
+         * they only dial when their side of it is gone, even if ours still looks alive.
+         */
+        val staleSessionMs: Long = 15_000,
     )
 
     sealed interface Pairing {
@@ -142,6 +147,11 @@ class Node(
     /** IDs of contacts with a live connection right now. */
     val online: StateFlow<Set<String>> = _online.asStateFlow()
 
+    private val _unread = MutableStateFlow<Map<String, Int>>(emptyMap())
+
+    /** Unread incoming messages per contact (only contacts with at least one). */
+    val unread: StateFlow<Map<String, Int>> = _unread.asStateFlow()
+
     private val _incoming = MutableSharedFlow<ChatMessage>(extraBufferCapacity = 64)
     val incoming: SharedFlow<ChatMessage> = _incoming.asSharedFlow()
 
@@ -170,9 +180,16 @@ class Node(
 
     private class Retry(val nextAt: Long, val failures: Int)
 
-    private inner class Session(val contactId: String, val channel: SecureChannel, initiatedByMe: Boolean) {
+    private inner class Session(val contactId: String, val channel: SecureChannel, val initiatedByMe: Boolean) {
         val unacked = LinkedHashMap<String, ChatMessage>() // guarded by this
         var ended = false // guarded by this
+        val createdAt = clock()
+
+        @Volatile
+        var lastHeardAt = clock()
+
+        /** Sending of queued messages happens one batch at a time, so they arrive in order. */
+        val flushLock = Any()
 
         /**
          * When both phones dial each other at the same moment, both keep the connection that was
@@ -203,6 +220,7 @@ class Node(
             republish()
             dialLoop()
         }
+        scope.launch { _contacts.value.forEach { updateUnread(it.id) } }
     }
 
     fun stop() {
@@ -224,6 +242,20 @@ class Node(
         wakeUp.trySend(Unit)
     }
 
+    /**
+     * Called periodically by the platform even while the phone sleeps (and when the network
+     * changes): drops connections that went silent, pings the rest and redials everyone else.
+     * Blocking; call from a background thread.
+     */
+    fun heartbeat() {
+        val now = clock()
+        for (session in synchronized(sessionsLock) { sessions.values.toList() }) {
+            val silent = now - session.lastHeardAt > config.readTimeoutMs
+            if (silent || runCatching { session.send(Wire.Ping) }.isFailure) session.channel.close()
+        }
+        refreshNow()
+    }
+
     fun contact(id: String): Contact? = _contacts.value.find { it.id == id }
 
     /** Loads a conversation from disk the first time; call from a background thread. */
@@ -243,7 +275,7 @@ class Node(
             wakeUp.trySend(Unit)
             return@withContext SendResult.QUEUED
         }
-        transmit(session, message)
+        flush(session) // older queued messages first
         SendResult.SENT
     }
 
@@ -254,8 +286,9 @@ class Node(
             conversation.value.filter { !it.outgoing && it.status == MessageStatus.RECEIVED }.map { it.id }
         }
         if (unread.isEmpty()) return@withContext
-        unread.forEach { setStatus(contactId, it, false, MessageStatus.READ) }
-        if (sendReadReceipts) {
+        val reportable = sendReadReceipts
+        unread.forEach { setStatus(contactId, it, false, if (reportable) MessageStatus.READ else MessageStatus.SEEN) }
+        if (reportable) {
             val session = synchronized(sessionsLock) { sessions[contactId] }
             runCatching { session?.send(Wire.Read(unread.takeLast(Wire.MAX_READ_IDS))) }
         }
@@ -536,6 +569,7 @@ class Node(
         closeSession(contactId)
         retries.remove(contactId)
         conversations.remove(contactId)?.let { flow -> synchronized(flow) { flow.value = emptyList() } }
+        _unread.update { it - contactId }
         store.deleteConversation(contactId)
         runCatching { host.deauthorizeClient(removed.onion) }
         republish() // they are no longer authorized to even find our onion service
@@ -656,7 +690,12 @@ class Node(
         val session = Session(contactId, channel, initiatedByMe)
         val replaced = synchronized(sessionsLock) {
             val existing = sessions[contactId]
-            if (!running || contact(contactId) == null || (existing != null && existing.preferred && !session.preferred)) {
+            // Simultaneous dials: both keep the preferred connection. But if they dialled us while we
+            // still hold an older connection, theirs died (e.g. they switched networks): take the new one.
+            val theirsIsFresh = existing != null && !initiatedByMe && clock() - existing.createdAt >= config.staleSessionMs
+            if (!running || contact(contactId) == null ||
+                (existing != null && existing.preferred && !session.preferred && !theirsIsFresh)
+            ) {
                 channel.close()
                 return
             }
@@ -673,14 +712,21 @@ class Node(
 
     /** On every new connection: send what waited while they were offline, and our read receipts. */
     private fun catchUp(session: Session) {
-        val messages = conversation(session.contactId).value
-        messages.filter { it.outgoing && it.status == MessageStatus.SENDING }
-            .sortedBy { it.timestamp }
-            .forEach { transmit(session, it) }
+        flush(session)
         if (sendReadReceipts) {
-            val read = messages.filter { !it.outgoing && it.status == MessageStatus.READ }.takeLast(Wire.MAX_READ_IDS)
+            val read = conversation(session.contactId).value
+                .filter { !it.outgoing && it.status == MessageStatus.READ }
+                .takeLast(Wire.MAX_READ_IDS)
             if (read.isNotEmpty()) runCatching { session.send(Wire.Read(read.map { it.id })) }
         }
+    }
+
+    /** Sends every message still waiting for this contact, oldest first. */
+    private fun flush(session: Session) = synchronized(session.flushLock) {
+        conversation(session.contactId).value
+            .filter { it.outgoing && it.status == MessageStatus.SENDING }
+            .sortedBy { it.timestamp }
+            .forEach { transmit(session, it) }
     }
 
     private suspend fun runSession(session: Session) = coroutineScope {
@@ -697,7 +743,7 @@ class Node(
         try {
             session.channel.setReadTimeout(config.readTimeoutMs)
             while (true) {
-                val message = runCatching { Wire.decode(session.channel.receive()) }
+                val message = runCatching { Wire.decode(session.channel.receive().also { session.lastHeardAt = clock() }) }
                     .getOrElse { if (it is IOException || it is java.security.GeneralSecurityException) throw it else null }
                     ?: continue
                 if (!handle(session, message)) break
@@ -766,7 +812,10 @@ class Node(
         }
         try {
             session.send(Wire.Text(message.id, message.body, message.timestamp))
-            setStatus(message.contactId, message.id, true, MessageStatus.SENT)
+            // If the session ended meanwhile, sessionEnded() already put it back in the queue.
+            synchronized(session) {
+                if (!session.ended) setStatus(message.contactId, message.id, true, MessageStatus.SENT)
+            }
         } catch (e: IOException) {
             session.channel.close() // sessionEnded() decides what happens to the message
         }
@@ -785,8 +834,14 @@ class Node(
         for (message in pending) {
             if (current != null) transmit(current, message) else requeue(message)
         }
-        // They may just have switched networks: try again soon instead of waiting for backoff.
-        if (current == null && running) retries[session.contactId] = Retry(clock() + config.retryMinMs / 4, 0)
+        if (current == null && running) {
+            if (clock() - session.createdAt >= config.staleSessionMs) {
+                // They may just have switched networks: try again soon instead of waiting for backoff.
+                retries[session.contactId] = Retry(clock() + config.retryMinMs / 4, 0)
+            } else {
+                scheduleRetry(session.contactId) // connections keep dying right away: back off
+            }
+        }
     }
 
     private fun closeSession(contactId: String) {
@@ -821,6 +876,7 @@ class Node(
             store.appendMessage(message)
             conversation.update { it + message }
         }
+        if (!message.outgoing) updateUnread(message.contactId)
         return true
     }
 
@@ -842,6 +898,14 @@ class Node(
                 list.map { if (it.id == id && it.outgoing == outgoing) it.copy(status = status) else it }
             }
         }
+        if (!outgoing) updateUnread(contactId)
+    }
+
+    private fun updateUnread(contactId: String) {
+        val count = if (contact(contactId) == null) 0 else {
+            conversation(contactId).value.count { !it.outgoing && it.status == MessageStatus.RECEIVED }
+        }
+        _unread.update { if (count == 0) it - contactId else it + (contactId to count) }
     }
 
     private fun newMessageId() = Hex.encode(SecureRandomHolder.bytes(16))
@@ -861,7 +925,7 @@ class Node(
             MessageStatus.SENDING, MessageStatus.FAILED, MessageStatus.RECEIVED -> 0
             MessageStatus.SENT -> 1
             MessageStatus.DELIVERED -> 2
-            MessageStatus.READ -> 3
+            MessageStatus.READ, MessageStatus.SEEN -> 3
         }
 
         private fun compareKeys(a: ByteArray, b: ByteArray): Int {

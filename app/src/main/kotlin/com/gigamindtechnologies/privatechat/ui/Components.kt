@@ -47,6 +47,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.gigamindtechnologies.privatechat.R
 import com.gigamindtechnologies.privatechat.TorStatus
 import com.gigamindtechnologies.privatechat.service.BackgroundAccess
+import com.gigamindtechnologies.privatechat.service.Notifications
 
 val OnlineGreen = Color(0xFF2E7D32)
 val ReadGreen = Color(0xFF1FAF5A)
@@ -99,6 +100,29 @@ fun TorBanner(tor: TorStatus, onRetry: () -> Unit) {
         }
         TorStatus.Failed -> Banner("Couldn't connect to Tor. Check your internet connection.", "Retry", onRetry)
         TorStatus.Stopped -> Banner("You're offline. Nobody can reach you.", "Go online", onRetry)
+    }
+}
+
+/** Shown while notifications are turned off, so new messages aren't silently missed. */
+@Composable
+fun NotificationsBanner() {
+    val context = LocalContext.current
+    var blocked by remember { mutableStateOf(Notifications.areBlocked(context)) }
+    LifecycleResumeEffect(Unit) {
+        blocked = Notifications.areBlocked(context)
+        onPauseOrDispose {}
+    }
+    if (!blocked) return
+    Surface(color = MaterialTheme.colorScheme.tertiaryContainer, modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Notifications are off, so you won't know when a message arrives.",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            TextButton(onClick = { Notifications.openSettings(context) }) { Text("Turn on") }
+        }
     }
 }
 

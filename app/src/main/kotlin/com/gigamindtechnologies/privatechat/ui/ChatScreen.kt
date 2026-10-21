@@ -59,7 +59,6 @@ import com.gigamindtechnologies.privatechat.core.protocol.Wire
 import com.gigamindtechnologies.privatechat.core.store.ChatMessage
 import com.gigamindtechnologies.privatechat.core.store.Contact
 import com.gigamindtechnologies.privatechat.core.store.MessageStatus
-import com.gigamindtechnologies.privatechat.service.Notifications
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -73,7 +72,6 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
     // Only while the app is in front: in the background, new messages should still notify.
     LifecycleResumeEffect(contactId) {
         graph.visibleChatId = contactId
-        Notifications.clearMessages(context)
         onPauseOrDispose { if (graph.visibleChatId == contactId) graph.visibleChatId = null }
     }
 
@@ -289,7 +287,7 @@ private fun Ticks(status: MessageStatus, showReadTicks: Boolean) {
         MessageStatus.READ ->
             if (showReadTicks) Triple(R.drawable.ic_tick_double, ReadGreen, "Read")
             else Triple(R.drawable.ic_tick_double, grey, "Delivered")
-        MessageStatus.RECEIVED -> return
+        MessageStatus.RECEIVED, MessageStatus.SEEN -> return // incoming messages have no ticks
     }
     Icon(painterResource(icon), contentDescription = label, tint = tint, modifier = Modifier.size(16.dp))
 }

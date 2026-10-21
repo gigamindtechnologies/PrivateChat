@@ -24,6 +24,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.concurrent.thread
 
 /**
  * Keeps Tor and the PrivateChat engine running while you are "online", so contacts can reach
@@ -46,10 +47,14 @@ class ChatService : Service() {
             .apply { setReferenceCounted(false) }
     }
 
-    /** When the phone gets a network again (Wi-Fi, mobile data), reconnect at once instead of waiting. */
+    /**
+     * When the phone gets a network again (Wi-Fi, mobile data), check the existing connections
+     * (they usually die on a network switch) and reconnect at once instead of waiting.
+     */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            node?.refreshNow()
+            val node = node ?: return
+            thread { node.heartbeat() }
         }
     }
     private var networkCallbackRegistered = false
@@ -64,7 +69,7 @@ class ChatService : Service() {
             ServiceCompat.startForeground(
                 this,
                 Notifications.SERVICE_ID,
-                Notifications.service(this),
+                Notifications.service(this, "Connecting privately…"),
                 if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0,
             )
         } catch (e: Exception) {
@@ -76,12 +81,14 @@ class ChatService : Service() {
         networkCallbackRegistered = runCatching {
             getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(networkCallback)
         }.isSuccess
+        Notifications.clearConnectionProblem(this)
+        Heartbeat.schedule(this)
         scope.launch { run() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopSelf()
+            graph.goOffline() // remembered, so a reboot or reopening the app doesn't bring us back online
             return START_NOT_STICKY
         }
         graph.node.value?.refreshNow()
@@ -107,22 +114,37 @@ class ChatService : Service() {
                     dialer = TorDialer(control.socksPort()),
                     log = { message, error -> graph.log(message, error) },
                     wake = { millis -> runCatching { wakeLock.acquire(millis) } },
-                ).also {
-                    it.sendReadReceipts = graph.readReceipts.value
-                    it.start()
-                }
+                ).also { it.sendReadReceipts = graph.readReceipts.value }
             }
             this.node = node
+            watchMessages(node) // listen before starting, so no early message is missed
+            withContext(Dispatchers.IO) { node.start() }
             graph.node.value = node
             graph.tor.value = TorStatus.Ready
-            node.incoming.collect { message ->
-                if (graph.visibleChatId != message.contactId) Notifications.newMessage(this)
-            }
+            Notifications.updateService(this, "Online privately — contacts can reach you")
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             graph.log("Could not start Tor", e)
             graph.tor.value = TorStatus.Failed
+            // Don't pretend to be online: stop, and tell the user how to get back.
+            Notifications.connectionProblem(this)
+            stopSelf()
+        }
+    }
+
+    /** Rings for each new message (unless its chat is open) and keeps the "N new messages" count right. */
+    private fun watchMessages(node: Node) {
+        val graph = graph
+        fun unreadElsewhere() = node.unread.value.filterKeys { it != graph.visibleChatId }.values.sum()
+        scope.launch {
+            node.incoming.collect { message ->
+                if (graph.visibleChatId != message.contactId) Notifications.showUnread(this@ChatService, unreadElsewhere(), alert = true)
+            }
+        }
+        scope.launch {
+            // Opening a chat reads its messages; the count shrinks silently and disappears at zero.
+            node.unread.collect { Notifications.showUnread(this@ChatService, unreadElsewhere(), alert = false) }
         }
     }
 
@@ -131,9 +153,10 @@ class ChatService : Service() {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback) }
         }
         runCatching { if (wakeLock.isHeld) wakeLock.release() }
+        Heartbeat.cancel(this)
         val graph = graph
         graph.node.value = null
-        graph.tor.value = TorStatus.Stopped
+        if (graph.tor.value != TorStatus.Failed) graph.tor.value = TorStatus.Stopped
         scope.cancel()
         val node = node
         val control = control

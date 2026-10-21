@@ -46,14 +46,20 @@ class NodeTest {
 
     private class Phone(val node: Node, val store: SecureStore, val identity: Identity, val client: FakeTorNetwork.Client)
 
-    private fun phone(name: String, config: Node.Config = fastConfig, store: SecureStore? = null): Phone {
+    private fun phone(
+        name: String,
+        config: Node.Config = fastConfig,
+        store: SecureStore? = null,
+        identity: Identity? = null,
+        clock: () -> Long = System::currentTimeMillis,
+    ): Phone {
         val s = store ?: SecureStore(tmp.newFolder(), sealer)
-        val identity = s.loadIdentity() ?: Identity.create(name, System.currentTimeMillis()).also { s.saveIdentity(it) }
+        val id = s.loadIdentity() ?: (identity ?: Identity.create(name, System.currentTimeMillis())).also { s.saveIdentity(it) }
         val client = network.Client()
-        val node = Node(s, identity, client, client, config)
+        val node = Node(s, id, client, client, config, clock = clock)
         nodes += node
         node.start()
-        return Phone(node, s, identity, client)
+        return Phone(node, s, id, client)
     }
 
     @After
@@ -168,7 +174,7 @@ class NodeTest {
         runBlocking { bob.node.sendText(aliceId, "did you read this?") }
         await("delivered") { bob.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.DELIVERED } }
         runBlocking { alice.node.markRead(bobId) }
-        assertEquals(MessageStatus.READ, alice.node.messages(bobId).value.single().status)
+        assertEquals(MessageStatus.SEEN, alice.node.messages(bobId).value.single().status)
         // Give a receipt time to arrive if one had been (wrongly) sent.
         runBlocking { bob.node.sendText(aliceId, "ping") }
         await("second delivered") { bob.node.messages(aliceId).value.last().takeIf { it.status == MessageStatus.DELIVERED } }
@@ -195,6 +201,103 @@ class NodeTest {
         await("green ticks after reconnect") {
             bob2.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.READ }
         }
+    }
+
+    /** Two identities where the first has the smaller key, so its connections are the "preferred" ones. */
+    private fun orderedIdentities(): Pair<Identity, Identity> {
+        while (true) {
+            val a = Identity.create("Alice", 1)
+            val b = Identity.create("Bob", 1)
+            val ka = a.staticKeyPair().publicKey
+            val kb = b.staticKeyPair().publicKey
+            val diff = ka.indices.map { (ka[it].toInt() and 0xff) - (kb[it].toInt() and 0xff) }.firstOrNull { it != 0 } ?: 0
+            if (diff < 0) return a to b
+        }
+    }
+
+    @Test
+    fun aContactWhoseConnectionDiedSilentlyCanReconnectAtOnce() {
+        network.useRelays = true
+        val (a, b) = orderedIdentities()
+        // Alice would only notice the dead connection after a minute; Bob notices quickly.
+        val alice = phone("Alice", fastConfig.copy(readTimeoutMs = 60_000, keepAliveMs = 60_000, staleSessionMs = 1_000), identity = a)
+        val bob = phone("Bob", fastConfig.copy(readTimeoutMs = 1_500, keepAliveMs = 300, staleSessionMs = 1_000), identity = b)
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { (aliceId in bob.node.online.value && bobId in alice.node.online.value).takeIf { it } }
+        Thread.sleep(1_200) // the connection is now older than staleSessionMs
+
+        network.freezeAll() // Bob's network drops; Alice's end of the connection still looks fine
+        await("bob notices") { bob.node.online.value.takeIf { it.isEmpty() } }
+        assertEquals(Node.SendResult.QUEUED, runBlocking { bob.node.sendText(aliceId, "after the network switch") })
+        // Bob's new connection must replace Alice's dead one long before her 60 s timeout.
+        await("delivered without waiting for Alice's timeout", timeoutMs = 15_000) {
+            alice.node.messages(bobId).value.find { it.body == "after the network switch" }
+        }
+    }
+
+    @Test
+    fun heartbeatDropsConnectionsThatWentSilentWhileThePhoneSlept() {
+        network.useRelays = true
+        var slept = 0L
+        val quiet = fastConfig.copy(readTimeoutMs = 60_000, keepAliveMs = 60_000, staleSessionMs = 0)
+        val alice = phone("Alice", quiet, clock = { System.currentTimeMillis() + slept })
+        val bob = phone("Bob", quiet)
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { (aliceId in bob.node.online.value && bobId in alice.node.online.value).takeIf { it } }
+
+        network.freezeAll()
+        slept = 120_000 // Alice's phone was asleep for two minutes; timers did not run
+        alice.node.heartbeat()
+        await("silent connection dropped") { alice.node.online.value.takeIf { it.isEmpty() || bobId in it } }
+        runBlocking { bob.node.sendText(aliceId, "good morning") }
+        await("delivered on a fresh connection", timeoutMs = 15_000) {
+            alice.node.messages(bobId).value.find { it.body == "good morning" }
+        }
+    }
+
+    @Test
+    fun unreadCountsFollowReading() {
+        val alice = phone("Alice")
+        val bob = phone("Bob")
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.node.online.value.takeIf { aliceId in it } }
+        runBlocking {
+            bob.node.sendText(aliceId, "one")
+            bob.node.sendText(aliceId, "two")
+        }
+        await("two unread") { alice.node.unread.value[bobId]?.takeIf { it == 2 } }
+        runBlocking { alice.node.markRead(bobId) }
+        assertNull(alice.node.unread.value[bobId])
+    }
+
+    @Test
+    fun messagesReadWhileReceiptsWereOffAreNeverReported() {
+        val alice = phone("Alice")
+        val bob = phone("Bob")
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.node.online.value.takeIf { aliceId in it } }
+        alice.node.sendReadReceipts = false
+        runBlocking { bob.node.sendText(aliceId, "private") }
+        await("delivered") { bob.node.messages(aliceId).value.single().takeIf { it.status == MessageStatus.DELIVERED } }
+        runBlocking { alice.node.markRead(bobId) }
+        assertEquals(MessageStatus.SEEN, alice.node.messages(bobId).value.single().status)
+
+        // Turning receipts back on (here: a restart, where they default to on) reports nothing old.
+        alice.node.stop()
+        val alice2 = phone("Alice", store = alice.store)
+        await("reconnected") { alice2.node.online.value.takeIf { bobId in it } }
+        runBlocking { bob.node.sendText(aliceId, "ping") }
+        await("ping delivered") { bob.node.messages(aliceId).value.last().takeIf { it.status == MessageStatus.DELIVERED } }
+        Thread.sleep(300)
+        assertEquals(MessageStatus.DELIVERED, bob.node.messages(aliceId).value.first().status)
     }
 
     @Test

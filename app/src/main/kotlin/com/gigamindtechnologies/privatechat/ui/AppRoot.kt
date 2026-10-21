@@ -104,10 +104,7 @@ private fun MainNavigation(graph: AppGraph) {
             onShowCode = { nav.push(Screen.ShowCode) },
             onScan = { nav.push(Screen.Scan) },
             onSettings = { nav.push(Screen.Settings) },
-            onRetryTor = {
-                graph.goOffline()
-                graph.goOnline()
-            },
+            onRetryTor = { graph.goOnline() },
         )
         Screen.ShowCode -> ShowCodeScreen(node = node, tor = tor, onPaired = { nav.replaceTop(Screen.Chat(it)) }, onBack = nav::pop)
         Screen.Scan -> ScanScreen(node = node, tor = tor, onPaired = { nav.replaceTop(Screen.Chat(it)) }, onBack = nav::pop)

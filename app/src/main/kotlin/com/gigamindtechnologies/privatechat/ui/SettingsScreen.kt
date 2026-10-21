@@ -40,6 +40,7 @@ import com.gigamindtechnologies.privatechat.IdentityState
 import com.gigamindtechnologies.privatechat.TorStatus
 import com.gigamindtechnologies.privatechat.core.node.Node
 import com.gigamindtechnologies.privatechat.service.BackgroundAccess
+import com.gigamindtechnologies.privatechat.service.Notifications
 import kotlinx.coroutines.launch
 
 @Composable
@@ -117,6 +118,28 @@ fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> U
                     } catch (_: ActivityNotFoundException) {
                     }
                 }) { Text("Open app settings") }
+            }
+
+            Section("Notifications") {
+                var blocked by remember { mutableStateOf(Notifications.areBlocked(context)) }
+                LifecycleResumeEffect(Unit) {
+                    blocked = Notifications.areBlocked(context)
+                    onPauseOrDispose {}
+                }
+                if (blocked) {
+                    Text(
+                        "Notifications are off. You won't know when a message arrives.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                } else {
+                    Text("✓ On", style = MaterialTheme.typography.titleMedium, color = OnlineGreen)
+                }
+                Text(
+                    "They only ever say how many new messages you have, never who sent them or what they say.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(onClick = { Notifications.openSettings(context) }) { Text("Notification settings") }
             }
 
             Section("Privacy") {

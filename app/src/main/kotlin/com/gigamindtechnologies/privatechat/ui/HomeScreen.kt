@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -60,6 +61,7 @@ fun HomeScreen(
     }
     val contacts = node?.contacts?.collectAsStateWithLifecycle()?.value ?: stored
     val online = node?.online?.collectAsStateWithLifecycle()?.value ?: emptySet()
+    val unread = node?.unread?.collectAsStateWithLifecycle()?.value ?: emptyMap()
 
     Scaffold(
         topBar = {
@@ -91,6 +93,7 @@ fun HomeScreen(
         Column(Modifier.padding(padding).fillMaxSize()) {
             TorBanner(tor, onRetryTor)
             BackgroundAccessBanner()
+            NotificationsBanner()
             if (contacts.isEmpty()) {
                 EmptyContacts()
             } else {
@@ -106,6 +109,10 @@ fun HomeScreen(
                                 )
                             },
                             leadingContent = { Avatar(contact.name, isOnline) },
+                            trailingContent = {
+                                val count = unread[contact.id] ?: 0
+                                if (count > 0) Badge { Text(if (count > 99) "99+" else count.toString()) }
+                            },
                             modifier = Modifier.clickable { onOpenChat(contact.id) },
                         )
                         HorizontalDivider()

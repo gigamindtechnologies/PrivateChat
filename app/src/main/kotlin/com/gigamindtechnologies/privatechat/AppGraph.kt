@@ -122,7 +122,7 @@ class AppGraph(private val app: Application) {
     /** Destroys the identity, contacts, messages, Tor state and the encryption key. */
     suspend fun wipeEverything() {
         withContext(Dispatchers.Main) { goOffline() }
-        withTimeoutOrNull(10_000) { tor.first { it == TorStatus.Stopped } }
+        withTimeoutOrNull(10_000) { tor.first { it == TorStatus.Stopped || it == TorStatus.Failed } }
         withContext(Dispatchers.IO) {
             synchronized(this@AppGraph) {
                 runCatching { _store?.wipe() }
