@@ -38,7 +38,7 @@ while your friend is offline waits on *your* phone and goes out as soon as they 
 | Encrypted storage, key in Android Keystore | A copied phone backup or file dump is unreadable |
 | No cloud backups | Nothing is copied to Google |
 | Screenshots blocked, app hidden in recent apps | Other apps and onlookers can't capture your chats |
-| Notifications say only "New message" | Your lock screen never shows names or text |
+| Notifications say only "N new messages" | Your lock screen never shows names or text |
 | Removing a contact removes it on both phones | They can no longer reach or find you |
 | Delete everything | Wipes identity, contacts, messages and destroys the encryption key |
 | No analytics, ads, crash reporting or Google services | Nothing reports on how you use the app |
@@ -124,7 +124,11 @@ then checks that strangers are refused with Tor's "missing client authorization"
 **On a device.** The app has been run on an Android 14 emulator, with its built-in Tor connected
 to the private test network through `adb reverse`. That run covered setup, Tor start-up, showing
 a code, the pairing request with matching safety symbols, chatting both ways with delivery
-receipts, and the contact going offline. This found a bug the JVM tests could not: on Android,
+receipts, and the contact going offline. A second run covered ticks up to green "read",
+"N new messages" notifications while the app is in the background, unread counts, messages
+waiting (🕓) while the contact is offline and then delivered automatically, recovery after Android
+kills the app, and going back online by itself after a reboot. The first run found a bug the JVM
+tests could not: on Android,
 `InetAddress.getLoopbackAddress()` is `::1`, so Tor (which forwards to `127.0.0.1`) could not
 reach the app. The engine now binds to `127.0.0.1` explicitly, and `core` tests run with
 `java.net.preferIPv6Addresses=true` to catch this on machines with IPv6.

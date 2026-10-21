@@ -56,7 +56,12 @@ forward secrecy in one round trip. The initiator must already know the responder
   data is sent after the handshake.
 - **Framing and padding.** Frames carry a 2-byte length. Every plaintext gets a 2-byte length
   prefix and is zero-padded to a multiple of 256 bytes before encryption (`SecureChannel.kt`).
-- **Keep-alive** pings every 30 s. A peer silent for 90 s is considered offline.
+- **Keep-alive** pings every 30 s. A peer silent for 90 s is considered offline. While the phone
+  sleeps (Doze) those timers stop, so an inexact alarm wakes it about every 15 minutes for 30 s
+  to drop silent connections, ping the rest and redial (`Node.heartbeat`). There is no push
+  server, so this is the only way a sleeping phone stays reachable.
+- **Offline queue.** Messages for an offline contact wait, encrypted, on the sender's phone and are
+  sent in order on the next connection; the receiver ignores duplicates by message ID.
 - **Duplicate connections.** When both phones dial at once, both keep the connection initiated by
   the phone with the lexicographically smaller static key. Messages that were not yet
   acknowledged on a dropped connection are resent on the surviving one. Receivers de-duplicate
@@ -119,7 +124,7 @@ contacts-only onion services.
 
 - `FLAG_SECURE` on the activity: no screenshots or screen recording, and the app is blank in recent apps.
 - `allowBackup=false` plus data-extraction rules that exclude every domain.
-- Notifications contain no names or message text.
+- Notifications contain no names or message text, only the number of unread messages.
 - Release builds log nothing. Debug logs never include names, addresses or message contents.
 - No analytics, crash reporting, advertising, Firebase or Google Play services. QR decoding is
   ZXing on the device.
