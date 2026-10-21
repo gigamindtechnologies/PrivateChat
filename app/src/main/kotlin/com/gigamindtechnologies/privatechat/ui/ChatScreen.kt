@@ -59,6 +59,7 @@ import com.gigamindtechnologies.privatechat.core.protocol.Wire
 import com.gigamindtechnologies.privatechat.core.store.ChatMessage
 import com.gigamindtechnologies.privatechat.core.store.Contact
 import com.gigamindtechnologies.privatechat.core.store.MessageStatus
+import com.gigamindtechnologies.privatechat.service.Notifications
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -72,6 +73,7 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
     // Only while the app is in front: in the background, new messages should still notify.
     LifecycleResumeEffect(contactId) {
         graph.visibleChatId = contactId
+        Notifications.cancelContactOnline(context, contactId)
         onPauseOrDispose { if (graph.visibleChatId == contactId) graph.visibleChatId = null }
     }
 
@@ -97,7 +99,11 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
         contact = stored.first
         messages = stored.second
     }
-    val online = node?.online?.collectAsStateWithLifecycle()?.value?.contains(contactId) == true
+    val connected = node?.online?.collectAsStateWithLifecycle()?.value?.contains(contactId) == true
+    val presence = node?.presence?.collectAsStateWithLifecycle()?.value?.get(contactId)
+    val hidden = presence?.hidden == true
+    val online = presence?.online == true
+    val hideFromEveryone by graph.hideStatus.collectAsStateWithLifecycle()
     val name = contact?.name ?: ""
     val showReadTicks by graph.readReceipts.collectAsStateWithLifecycle()
 
@@ -114,6 +120,7 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var removing by remember { mutableStateOf(false) }
+    var statusHiddenInfo by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -124,17 +131,45 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
                 title = {
                     Column {
                         Text(name)
-                        Text(
-                            if (online) "Online" else "Offline",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (online) OnlineGreen else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        // Nothing at all when either of you hides it, like WhatsApp.
+                        val status = when {
+                            online -> "online"
+                            hidden -> null
+                            else -> presence?.lastSeen?.let(::lastSeenText)
+                        }
+                        if (status != null) {
+                            Text(
+                                status,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (online) OnlineGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 },
                 actions = {
                     if (node != null) {
                         IconButton(onClick = { menuOpen = true }) { Icon(painterResource(R.drawable.ic_more), contentDescription = "More") }
                         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                            val notifyOnline = contact?.notifyOnline == true
+                            DropdownMenuItem(
+                                text = { Text("Tell me when $name is online") },
+                                leadingIcon = { MenuCheck(notifyOnline) },
+                                onClick = {
+                                    menuOpen = false
+                                    scope.launch { node.setNotifyOnline(contactId, !notifyOnline) }
+                                    if (!notifyOnline && hidden) statusHiddenInfo = true
+                                },
+                            )
+                            val hideMine = contact?.hideMyStatus == true
+                            DropdownMenuItem(
+                                text = { Text(if (hideFromEveryone) "Status hidden from everyone" else "Hide my status from $name") },
+                                leadingIcon = { MenuCheck(hideMine || hideFromEveryone) },
+                                enabled = !hideFromEveryone,
+                                onClick = {
+                                    menuOpen = false
+                                    scope.launch { node.setHideStatus(contactId, !hideMine) }
+                                },
+                            )
                             DropdownMenuItem(text = { Text("Rename") }, onClick = { menuOpen = false; renaming = true })
                             DropdownMenuItem(text = { Text("Remove contact") }, onClick = { menuOpen = false; removing = true })
                         }
@@ -144,7 +179,7 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
         },
         bottomBar = {
             Column(Modifier.navigationBarsPadding().imePadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                if (!online) {
+                if (!connected && !hidden) {
                     Text(
                         if (node == null) {
                             "Connecting to Tor…"
@@ -213,6 +248,19 @@ fun ChatScreen(graph: AppGraph, node: Node?, contactId: String, onBack: () -> Un
             scope.launch { node.renameContact(contactId, newName) }
         })
     }
+    if (statusHiddenInfo) {
+        AlertDialog(
+            onDismissRequest = { statusHiddenInfo = false },
+            title = { Text("Online status is hidden") },
+            text = {
+                Text(
+                    "You won't be told when $name is online while either of you hides your online status. " +
+                        "It works again as soon as you both show it.",
+                )
+            },
+            confirmButton = { TextButton(onClick = { statusHiddenInfo = false }) { Text("OK") } },
+        )
+    }
     if (removing && node != null) {
         AlertDialog(
             onDismissRequest = { removing = false },
@@ -278,7 +326,7 @@ private fun MessageBubble(message: ChatMessage, showReadTicks: Boolean) {
  * With read receipts off, we don't show theirs either (like WhatsApp).
  */
 @Composable
-private fun Ticks(status: MessageStatus, showReadTicks: Boolean) {
+fun Ticks(status: MessageStatus, showReadTicks: Boolean) {
     val grey = MaterialTheme.colorScheme.onSurfaceVariant
     val (icon, tint, label) = when (status) {
         MessageStatus.SENDING, MessageStatus.FAILED -> Triple(R.drawable.ic_tick_clock, grey, "Waiting to send")
@@ -290,6 +338,15 @@ private fun Ticks(status: MessageStatus, showReadTicks: Boolean) {
         MessageStatus.RECEIVED, MessageStatus.SEEN -> return // incoming messages have no ticks
     }
     Icon(painterResource(icon), contentDescription = label, tint = tint, modifier = Modifier.size(16.dp))
+}
+
+@Composable
+private fun MenuCheck(checked: Boolean) {
+    if (checked) {
+        Icon(painterResource(R.drawable.ic_check), contentDescription = "On", tint = MaterialTheme.colorScheme.primary)
+    } else {
+        Spacer(Modifier.size(24.dp))
+    }
 }
 
 @Composable

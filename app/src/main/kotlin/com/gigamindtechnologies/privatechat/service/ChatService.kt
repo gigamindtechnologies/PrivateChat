@@ -54,7 +54,7 @@ class ChatService : Service() {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val node = node ?: return
-            thread { node.heartbeat() }
+            thread { node.networkChanged() }
         }
     }
     private var networkCallbackRegistered = false
@@ -114,7 +114,10 @@ class ChatService : Service() {
                     dialer = TorDialer(control.socksPort()),
                     log = { message, error -> graph.log(message, error) },
                     wake = { millis -> runCatching { wakeLock.acquire(millis) } },
-                ).also { it.sendReadReceipts = graph.readReceipts.value }
+                ).also {
+                    it.sendReadReceipts = graph.readReceipts.value
+                    it.setHideStatusFromEveryone(graph.hideStatus.value)
+                }
             }
             this.node = node
             watchMessages(node) // listen before starting, so no early message is missed
@@ -133,18 +136,36 @@ class ChatService : Service() {
         }
     }
 
-    /** Rings for each new message (unless its chat is open) and keeps the "N new messages" count right. */
+    /**
+     * Rings for each new message (unless its chat is open) and keeps the "N new messages" count
+     * right. Also shows "X is online" for contacts the user asked about.
+     */
     private fun watchMessages(node: Node) {
         val graph = graph
-        fun unreadElsewhere() = node.unread.value.filterKeys { it != graph.visibleChatId }.values.sum()
+        fun show(alert: Boolean) {
+            val elsewhere = node.unread.value.filterKeys { it != graph.visibleChatId }
+            Notifications.showUnread(this, elsewhere.values.sum(), alert, elsewhere.keys.singleOrNull())
+        }
         scope.launch {
-            node.incoming.collect { message ->
-                if (graph.visibleChatId != message.contactId) Notifications.showUnread(this@ChatService, unreadElsewhere(), alert = true)
-            }
+            node.incoming.collect { message -> if (graph.visibleChatId != message.contactId) show(alert = true) }
         }
         scope.launch {
             // Opening a chat reads its messages; the count shrinks silently and disappears at zero.
-            node.unread.collect { Notifications.showUnread(this@ChatService, unreadElsewhere(), alert = false) }
+            node.unread.collect { show(alert = false) }
+        }
+        scope.launch {
+            node.cameOnline.collect { id ->
+                val name = node.contact(id)?.name ?: return@collect
+                if (graph.visibleChatId != id) Notifications.contactOnline(this@ChatService, id, name)
+            }
+        }
+        scope.launch {
+            var shown = emptySet<String>()
+            node.presence.collect { presence ->
+                val online = presence.filterValues { it.online }.keys
+                (shown - online).forEach { Notifications.cancelContactOnline(this@ChatService, it) }
+                shown = online
+            }
         }
     }
 

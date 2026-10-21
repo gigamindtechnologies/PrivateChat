@@ -60,6 +60,8 @@ class SecureStore(private val dir: File, private val sealer: Sealer) {
     private val identityFile get() = File(dir, "identity.bin")
     private val contactsFile get() = File(dir, "contacts.bin")
     private val messagesDir get() = File(dir, "messages")
+    private val presenceFile get() = File(dir, "presence.bin")
+    private val lockFile get() = File(dir, "lock.bin")
 
     @Serializable
     private sealed class LogRecord {
@@ -92,6 +94,30 @@ class SecureStore(private val dir: File, private val sealer: Sealer) {
         "contacts",
         json.encodeToString(ListSerializer(Contact.serializer()), contacts).encodeToByteArray(),
     )
+
+    @Synchronized
+    fun loadPresence(): PresenceState = runCatching {
+        readSealed(presenceFile, "presence")?.let { json.decodeFromString(PresenceState.serializer(), it.decodeToString()) }
+    }.getOrNull() ?: PresenceState()
+
+    @Synchronized
+    fun savePresence(state: PresenceState) =
+        writeSealed(presenceFile, "presence", json.encodeToString(PresenceState.serializer(), state).encodeToByteArray())
+
+    @Synchronized
+    fun loadAppLock(): AppLockConfig? = readSealed(lockFile, "lock")?.let {
+        json.decodeFromString(AppLockConfig.serializer(), it.decodeToString())
+    }
+
+    /** Saves the app lock, or removes it when [config] is null. */
+    @Synchronized
+    fun saveAppLock(config: AppLockConfig?) {
+        if (config == null) {
+            lockFile.delete()
+        } else {
+            writeSealed(lockFile, "lock", json.encodeToString(AppLockConfig.serializer(), config).encodeToByteArray())
+        }
+    }
 
     @Synchronized
     fun loadMessages(contactId: String): List<ChatMessage> {

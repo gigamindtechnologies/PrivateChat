@@ -15,6 +15,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -39,12 +40,20 @@ import com.gigamindtechnologies.privatechat.AppGraph
 import com.gigamindtechnologies.privatechat.IdentityState
 import com.gigamindtechnologies.privatechat.TorStatus
 import com.gigamindtechnologies.privatechat.core.node.Node
+import com.gigamindtechnologies.privatechat.security.Biometric
 import com.gigamindtechnologies.privatechat.service.BackgroundAccess
 import com.gigamindtechnologies.privatechat.service.Notifications
 import kotlinx.coroutines.launch
 
 @Composable
-fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> Unit, onWiped: () -> Unit) {
+fun SettingsScreen(
+    graph: AppGraph,
+    node: Node?,
+    tor: TorStatus,
+    onBack: () -> Unit,
+    onWiped: () -> Unit,
+    onSetPin: (PinFlow) -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val identity = (graph.identity.collectAsStateWithLifecycle().value as? IdentityState.Ready)?.identity
@@ -136,7 +145,9 @@ fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> U
                     Text("✓ On", style = MaterialTheme.typography.titleMedium, color = OnlineGreen)
                 }
                 Text(
-                    "They only ever say how many new messages you have, never who sent them or what they say.",
+                    "They only ever say how many new messages you have, never who sent them or what they say. " +
+                        "The exception is \"… is online\", which you can switch on for a contact in their chat menu: " +
+                        "it shows their name, but not on the lock screen.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 OutlinedButton(onClick = { Notifications.openSettings(context) }) { Text("Notification settings") }
@@ -153,6 +164,55 @@ fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> U
                         "When off, they don't, and you won't see theirs either.",
                     style = MaterialTheme.typography.bodySmall,
                 )
+                val hideStatus by graph.hideStatus.collectAsStateWithLifecycle()
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
+                    Text("Hide my online status", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Switch(checked = hideStatus, onCheckedChange = graph::setHideStatus)
+                }
+                Text(
+                    "Contacts won't see when you're online or when you were last seen, and you won't see theirs. " +
+                        "You can also hide it from one contact only, in their chat menu. Ticks still show when a " +
+                        "message has reached a phone. \"Last seen\" is only ever stored on this phone.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            Section("App lock") {
+                val lock by graph.appLock.collectAsStateWithLifecycle()
+                if (lock == null) {
+                    Text("Off", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Ask for a PIN (or fingerprint) every time PrivateChat is opened. Messages keep arriving while it is locked.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Button(onClick = { onSetPin(PinFlow.CREATE) }) { Text("Turn on app lock") }
+                } else {
+                    Text("✓ On", style = MaterialTheme.typography.titleMedium, color = OnlineGreen)
+                    if (Biometric.isAvailable(context)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Unlock with fingerprint", modifier = Modifier.weight(1f))
+                            Switch(
+                                checked = lock?.biometric == true,
+                                onCheckedChange = { scope.launch { graph.setBiometricUnlock(it) } },
+                            )
+                        }
+                    }
+                    val delay by graph.lockDelayMs.collectAsStateWithLifecycle()
+                    Text("Lock", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(0L to "Immediately", 60_000L to "After 1 min", 5 * 60_000L to "After 5 min").forEach { (ms, label) ->
+                            FilterChip(selected = delay == ms, onClick = { graph.setLockDelay(ms) }, label = { Text(label) })
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { onSetPin(PinFlow.CHANGE) }) { Text("Change PIN") }
+                        OutlinedButton(onClick = { onSetPin(PinFlow.REMOVE) }) { Text("Turn off") }
+                    }
+                    Text(
+                        "If you forget your PIN, the only way back in is to uninstall the app, which deletes your messages.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
 
             Section("How you're protected") {
@@ -162,7 +222,7 @@ fun SettingsScreen(graph: AppGraph, node: Node?, tor: TorStatus, onBack: () -> U
                     "Only your contacts can even find your address on the Tor network.",
                     "Every connection is end-to-end encrypted with fresh keys (forward secrecy).",
                     "Messages are encrypted on this phone with a key kept in the Android Keystore.",
-                    "Screenshots are blocked, notifications never show names or text, and nothing is backed up to the cloud.",
+                    "Screenshots are blocked, message notifications never show names or text, and nothing is backed up to the cloud.",
                 ).forEach { Text("•  $it", style = MaterialTheme.typography.bodyMedium) }
                 if (node != null) {
                     Text(

@@ -37,6 +37,7 @@ sealed interface Screen {
     data object Scan : Screen
     data class Chat(val contactId: String) : Screen
     data object Settings : Screen
+    data class SetPin(val flow: PinFlow) : Screen
 }
 
 class NavViewModel : ViewModel() {
@@ -76,7 +77,12 @@ fun AppRoot(graph: AppGraph) {
                 }
             })
             IdentityState.Unreadable -> UnreadableScreen(onReset = { scope.launch { graph.wipeEverything() } })
-            is IdentityState.Ready -> MainNavigation(graph)
+            is IdentityState.Ready -> {
+                val locked by graph.locked.collectAsStateWithLifecycle()
+                // Connect even while locked, so messages keep arriving.
+                LaunchedEffect(Unit) { if (graph.wantsOnline.value) graph.goOnline() }
+                if (locked) LockScreen(graph) else MainNavigation(graph)
+            }
         }
     }
 }
@@ -89,8 +95,16 @@ private fun MainNavigation(graph: AppGraph) {
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     LaunchedEffect(Unit) {
-        if (graph.wantsOnline.value) graph.goOnline()
         if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    // A tapped notification opens its chat.
+    val openChat by graph.openChat.collectAsStateWithLifecycle()
+    LaunchedEffect(openChat) {
+        val contactId = openChat ?: return@LaunchedEffect
+        graph.openChat.value = null
+        nav.reset()
+        nav.push(Screen.Chat(contactId))
     }
 
     BackHandler(enabled = nav.stack.size > 1) { nav.pop() }
@@ -109,7 +123,15 @@ private fun MainNavigation(graph: AppGraph) {
         Screen.ShowCode -> ShowCodeScreen(node = node, tor = tor, onPaired = { nav.replaceTop(Screen.Chat(it)) }, onBack = nav::pop)
         Screen.Scan -> ScanScreen(node = node, tor = tor, onPaired = { nav.replaceTop(Screen.Chat(it)) }, onBack = nav::pop)
         is Screen.Chat -> ChatScreen(graph = graph, node = node, contactId = screen.contactId, onBack = nav::pop)
-        Screen.Settings -> SettingsScreen(graph = graph, node = node, tor = tor, onBack = nav::pop, onWiped = nav::reset)
+        Screen.Settings -> SettingsScreen(
+            graph = graph,
+            node = node,
+            tor = tor,
+            onBack = nav::pop,
+            onWiped = nav::reset,
+            onSetPin = { nav.push(Screen.SetPin(it)) },
+        )
+        is Screen.SetPin -> PinSetupScreen(graph, screen.flow, onDone = nav::pop)
     }
 }
 

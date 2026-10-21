@@ -16,13 +16,20 @@ import androidx.core.content.ContextCompat
 import com.gigamindtechnologies.privatechat.R
 import com.gigamindtechnologies.privatechat.ui.MainActivity
 
-/** Notifications never contain names or message text: only how many new messages there are. */
+/**
+ * Message notifications never contain names or message text: only how many new messages there
+ * are. The only exception is the "is online" alert you switch on for a contact: it names them,
+ * but not on the lock screen.
+ */
 object Notifications {
     const val SERVICE_ID = 1
     private const val MESSAGES_ID = 2
     private const val PROBLEM_ID = 3
+    private const val ONLINE_ID = 4
     private const val CHANNEL_SERVICE = "status"
     private const val CHANNEL_MESSAGES = "messages"
+    private const val CHANNEL_ONLINE = "online"
+    const val EXTRA_CONTACT = "contact"
 
     fun createChannels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java)
@@ -34,6 +41,12 @@ object Notifications {
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_MESSAGES, "New messages", NotificationManager.IMPORTANCE_HIGH).apply {
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+            },
+        )
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ONLINE, "Contact is online", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                setShowBadge(false)
             },
         )
     }
@@ -62,9 +75,10 @@ object Notifications {
 
     /**
      * Shows "N new messages", or removes the notification when there are none. [alert] makes
-     * it ring (a new message arrived); otherwise the number is updated silently.
+     * it ring (a new message arrived); otherwise the number is updated silently. Tapping it opens
+     * [onlyChat] when all new messages are in that one chat.
      */
-    fun showUnread(context: Context, count: Int, alert: Boolean) {
+    fun showUnread(context: Context, count: Int, alert: Boolean, onlyChat: String? = null) {
         if (count <= 0) {
             NotificationManagerCompat.from(context).cancel(MESSAGES_ID)
             return
@@ -74,7 +88,7 @@ object Notifications {
             .setContentTitle(if (count == 1) "New message" else "$count new messages")
             .setContentText("Open PrivateChat to read")
             .setNumber(count)
-            .setContentIntent(openApp(context))
+            .setContentIntent(onlyChat?.let { openChat(context, it) } ?: openApp(context))
             .setAutoCancel(true)
             .setOnlyAlertOnce(!alert)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -82,6 +96,29 @@ object Notifications {
             .build()
         post(context, MESSAGES_ID, notification)
     }
+
+    /** "Alice is online", for a contact you asked to be told about. The lock screen shows no name. */
+    fun contactOnline(context: Context, contactId: String, name: String) {
+        val public = NotificationCompat.Builder(context, CHANNEL_ONLINE)
+            .setSmallIcon(R.drawable.ic_lock)
+            .setContentTitle("A contact is online")
+            .build()
+        val notification = NotificationCompat.Builder(context, CHANNEL_ONLINE)
+            .setSmallIcon(R.drawable.ic_lock)
+            .setContentTitle("$name is online")
+            .setContentText("Tap to chat")
+            .setContentIntent(openChat(context, contactId))
+            .setAutoCancel(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(public)
+            .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .build()
+        post(context, contactId, ONLINE_ID, notification)
+    }
+
+    /** Removes the "is online" alert once they are offline again (or the chat was opened). */
+    fun cancelContactOnline(context: Context, contactId: String) =
+        NotificationManagerCompat.from(context).cancel(contactId, ONLINE_ID)
 
     /** Shown when the app could not stay online, so the user knows they are unreachable. */
     fun connectionProblem(context: Context) = post(
@@ -114,15 +151,26 @@ object Notifications {
         runCatching { context.startActivity(intent) }
     }
 
-    private fun post(context: Context, id: Int, notification: Notification) {
+    private fun post(context: Context, id: Int, notification: Notification) = post(context, null, id, notification)
+
+    private fun post(context: Context, tag: String?, id: Int, notification: Notification) {
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             return
         }
         // A broken notification must never break message delivery.
-        runCatching { NotificationManagerCompat.from(context).notify(id, notification) }
+        runCatching { NotificationManagerCompat.from(context).notify(tag, id, notification) }
     }
+
+    private fun openChat(context: Context, contactId: String): PendingIntent = PendingIntent.getActivity(
+        context,
+        contactId.hashCode(), // one per chat, so the extras of one don't replace another's
+        Intent(context, MainActivity::class.java)
+            .putExtra(EXTRA_CONTACT, contactId)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     private fun openApp(context: Context): PendingIntent = PendingIntent.getActivity(
         context,

@@ -56,6 +56,10 @@ data class Contact(
     /** x25519 public key (base64) we authorized on our onion service for them. */
     val inboundAuthKey: String,
     val addedAt: Long,
+    /** Show a notification when this contact comes online. */
+    val notifyOnline: Boolean = false,
+    /** Don't show this contact when we are online or last seen (and, in return, don't see theirs). */
+    val hideMyStatus: Boolean = false,
 ) {
     fun staticKeyBytes(): ByteArray = B64.decode(staticKey)
 
@@ -69,6 +73,29 @@ data class Contact(
  * (their phone saved it) → [READ] (they opened the chat).
  * Incoming: [RECEIVED] → [READ] (we opened the chat).
  */
+/**
+ * Presence facts this phone has observed itself. Never sent anywhere: "last seen" is the last
+ * time our phone had a connection with theirs.
+ */
+@Serializable
+data class PresenceState(
+    val lastSeen: Map<String, Long> = emptyMap(),
+    /** Contacts who asked us not to show their status. */
+    val hiddenBy: Set<String> = emptySet(),
+)
+
+/** App lock: a salted PBKDF2 hash of the PIN, kept in the encrypted vault. */
+@Serializable
+data class AppLockConfig(
+    val salt: String,
+    val hash: String,
+    val iterations: Int,
+    val biometric: Boolean = false,
+    /** Wrong PINs in a row, and when the next try is allowed (slows down guessing). */
+    val failures: Int = 0,
+    val blockedUntil: Long = 0,
+)
+
 @Serializable
 enum class MessageStatus {
     SENDING,

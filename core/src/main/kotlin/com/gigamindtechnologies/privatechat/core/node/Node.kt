@@ -15,6 +15,7 @@ import com.gigamindtechnologies.privatechat.core.store.ChatMessage
 import com.gigamindtechnologies.privatechat.core.store.Contact
 import com.gigamindtechnologies.privatechat.core.store.Identity
 import com.gigamindtechnologies.privatechat.core.store.MessageStatus
+import com.gigamindtechnologies.privatechat.core.store.PresenceState
 import com.gigamindtechnologies.privatechat.core.store.SecureStore
 import com.gigamindtechnologies.privatechat.core.tor.OnionAddress
 import com.gigamindtechnologies.privatechat.core.tor.OnionKey
@@ -103,7 +104,27 @@ class Node(
          * they only dial when their side of it is gone, even if ours still looks alive.
          */
         val staleSessionMs: Long = 15_000,
+        /** How long to wait for a contact's presence setting before showing them online (older versions send none). */
+        val presenceGraceMs: Long = 3_000,
+        /** "Came online" alerts: the connection must last this long, so flaky networks don't spam. */
+        val onlineAlertDelayMs: Long = 20_000,
+        /** No alerts this soon after our own app or network (re)started: everyone "comes online" then. */
+        val onlineAlertQuietMs: Long = 120_000,
+        /** Only alert if they had been gone at least this long. */
+        val onlineAlertMinOfflineMs: Long = 5 * 60_000,
+        /** At most one alert per contact this often. */
+        val onlineAlertIntervalMs: Long = 30 * 60_000,
     )
+
+    /**
+     * What we may show about a contact. [hidden]: they asked us not to show their status, or we
+     * hide ours from them (then, like WhatsApp, we don't see theirs either). [lastSeen] is the last
+     * time this phone had a connection with theirs; it is only ever stored on this phone.
+     */
+    data class PeerPresence(val online: Boolean, val lastSeen: Long?, val hidden: Boolean)
+
+    /** For the chat list: unread count and the latest message. */
+    data class ChatSummary(val unread: Int, val last: ChatMessage?)
 
     sealed interface Pairing {
         data object Idle : Pairing
@@ -152,6 +173,30 @@ class Node(
     /** Unread incoming messages per contact (only contacts with at least one). */
     val unread: StateFlow<Map<String, Int>> = _unread.asStateFlow()
 
+    private val _summaries = MutableStateFlow<Map<String, ChatSummary>>(emptyMap())
+    val summaries: StateFlow<Map<String, ChatSummary>> = _summaries.asStateFlow()
+
+    private val _presence = MutableStateFlow<Map<String, PeerPresence>>(emptyMap())
+    val presence: StateFlow<Map<String, PeerPresence>> = _presence.asStateFlow()
+
+    private val _cameOnline = MutableSharedFlow<String>(extraBufferCapacity = 16)
+
+    /** Contact IDs that just came online and asked to be notified about ([Contact.notifyOnline]). */
+    val cameOnline: SharedFlow<String> = _cameOnline.asSharedFlow()
+
+    private val lastSeen = ConcurrentHashMap<String, Long>()
+    private val hiddenBy: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val lastAlertAt = ConcurrentHashMap<String, Long>()
+
+    /** When we noticed a contact's connection was gone (not when we last heard them: we may have slept). */
+    private val offlineSince = ConcurrentHashMap<String, Long>()
+
+    @Volatile
+    private var hideFromEveryone = false
+
+    @Volatile
+    private var quietUntil = 0L
+
     private val _incoming = MutableSharedFlow<ChatMessage>(extraBufferCapacity = 64)
     val incoming: SharedFlow<ChatMessage> = _incoming.asSharedFlow()
 
@@ -191,6 +236,14 @@ class Node(
         /** Sending of queued messages happens one batch at a time, so they arrive in order. */
         val flushLock = Any()
 
+        /** Set once their presence setting arrived (or the grace time passed). */
+        @Volatile
+        var presenceKnown = false
+
+        /** For "came online" alerts: false when this connection just replaced another one. */
+        var arrival = false
+        var awaySince: Long? = null
+
         /**
          * When both phones dial each other at the same moment, both keep the connection that was
          * started by the phone with the smaller public key, so they always agree on one.
@@ -212,6 +265,12 @@ class Node(
     fun start() {
         check(!running) { "Already started" }
         running = true
+        quietUntil = clock() + config.onlineAlertQuietMs
+        store.loadPresence().let { saved ->
+            if (!hideFromEveryone) lastSeen.putAll(saved.lastSeen)
+            hiddenBy.addAll(saved.hiddenBy)
+        }
+        publishPresence()
         val server = ServerSocket(0, 50, LOOPBACK)
         mainServer = server
         scope.launch { acceptLoop(server) }
@@ -220,7 +279,7 @@ class Node(
             republish()
             dialLoop()
         }
-        scope.launch { _contacts.value.forEach { updateUnread(it.id) } }
+        scope.launch { _contacts.value.forEach { updateSummary(it.id) } }
     }
 
     fun stop() {
@@ -228,7 +287,10 @@ class Node(
         running = false
         cancelPairing()
         runCatching { mainServer?.close() }
-        synchronized(sessionsLock) { sessions.values.toList() }.forEach { it.channel.close() }
+        val live = synchronized(sessionsLock) { sessions.values.toList() }
+        live.forEach { recordLastSeen(it) }
+        savePresence()
+        live.forEach { it.channel.close() }
         scope.cancel()
         synchronized(publishLock) {
             if (published) runCatching { host.unpublish(onionKey.address) }
@@ -253,7 +315,43 @@ class Node(
             val silent = now - session.lastHeardAt > config.readTimeoutMs
             if (silent || runCatching { session.send(Wire.Ping) }.isFailure) session.channel.close()
         }
+        // Keep "last seen" roughly current even if the app is killed without a chance to save.
+        synchronized(sessionsLock) { sessions.values.toList() }.forEach { recordLastSeen(it) }
+        savePresence()
         refreshNow()
+    }
+
+    /** The phone's network changed: everyone will seem to "come online" again, so pause alerts. */
+    fun networkChanged() {
+        quietUntil = maxOf(quietUntil, clock() + config.onlineAlertQuietMs)
+        heartbeat()
+    }
+
+    /** Hide (or show) when we are online and last seen from all contacts. Can be set before [start]. */
+    fun setHideStatusFromEveryone(hide: Boolean) {
+        if (hideFromEveryone == hide) return
+        hideFromEveryone = hide
+        if (!running) return
+        if (hide) {
+            lastSeen.clear() // we don't keep theirs either
+            savePresence()
+        }
+        synchronized(sessionsLock) { sessions.values.toList() }.forEach { sendPresence(it) }
+        publishPresence()
+    }
+
+    suspend fun setHideStatus(contactId: String, hide: Boolean) = withContext(Dispatchers.IO) {
+        updateContact(contactId) { it.copy(hideMyStatus = hide) }
+        if (hide) {
+            lastSeen.remove(contactId)
+            savePresence()
+        }
+        synchronized(sessionsLock) { sessions[contactId] }?.let { sendPresence(it) }
+        publishPresence()
+    }
+
+    suspend fun setNotifyOnline(contactId: String, notify: Boolean) = withContext(Dispatchers.IO) {
+        updateContact(contactId) { it.copy(notifyOnline = notify) }
     }
 
     fun contact(id: String): Contact? = _contacts.value.find { it.id == id }
@@ -295,11 +393,13 @@ class Node(
     }
 
     suspend fun renameContact(contactId: String, name: String) = withContext(Dispatchers.IO) {
-        synchronized(contactsLock) {
-            val list = _contacts.value.map { if (it.id == contactId) it.copy(name = sanitizeName(name)) else it }
-            store.saveContacts(list)
-            _contacts.value = list
-        }
+        updateContact(contactId) { it.copy(name = sanitizeName(name)) }
+    }
+
+    private fun updateContact(contactId: String, change: (Contact) -> Contact) = synchronized(contactsLock) {
+        val list = _contacts.value.map { if (it.id == contactId) change(it) else it }
+        store.saveContacts(list)
+        _contacts.value = list
     }
 
     /** Removes the contact on this phone and, if they are online, on theirs too. */
@@ -545,7 +645,8 @@ class Node(
     private fun contactByKey(key: ByteArray): Contact? =
         contact(Contact.idFor(key))?.takeIf { it.staticKeyBytes().contentEquals(key) }
 
-    private fun addContact(contact: Contact) {
+    private fun addContact(new: Contact) {
+        val contact = contact(new.id)?.let { old -> new.copy(notifyOnline = old.notifyOnline, hideMyStatus = old.hideMyStatus) } ?: new
         synchronized(contactsLock) {
             val list = _contacts.value.filter { it.id != contact.id } + contact
             store.saveContacts(list)
@@ -570,6 +671,13 @@ class Node(
         retries.remove(contactId)
         conversations.remove(contactId)?.let { flow -> synchronized(flow) { flow.value = emptyList() } }
         _unread.update { it - contactId }
+        _summaries.update { it - contactId }
+        lastSeen.remove(contactId)
+        hiddenBy.remove(contactId)
+        lastAlertAt.remove(contactId)
+        offlineSince.remove(contactId)
+        savePresence()
+        publishPresence()
         store.deleteConversation(contactId)
         runCatching { host.deauthorizeClient(removed.onion) }
         republish() // they are no longer authorized to even find our onion service
@@ -702,16 +810,27 @@ class Node(
             sessions[contactId] = session
             existing
         }
+        if (replaced == null) {
+            session.arrival = true
+            session.awaySince = offlineSince[contactId] ?: lastSeen[contactId]
+        } else {
+            session.presenceKnown = replaced.presenceKnown // a reconnect: no flicker, no alert
+        }
         retries.remove(contactId)
         replaced?.channel?.close() // its unacknowledged messages move to the new session
         publishOnline()
         wake(15_000)
         scope.launch { runSession(session) }
         scope.launch { catchUp(session) }
+        scope.launch {
+            delay(config.presenceGraceMs)
+            markPresenceKnown(session)
+        }
     }
 
     /** On every new connection: send what waited while they were offline, and our read receipts. */
     private fun catchUp(session: Session) {
+        sendPresence(session)
         flush(session)
         if (sendReadReceipts) {
             val read = conversation(session.contactId).value
@@ -768,6 +887,15 @@ class Node(
             is Wire.Read -> message.ids.take(Wire.MAX_READ_IDS).filter { MESSAGE_ID.matches(it) }.forEach { id ->
                 synchronized(session) { session.unacked.remove(id) }
                 setStatus(session.contactId, id, true, MessageStatus.READ)
+            }
+            is Wire.Presence -> {
+                if (message.show) hiddenBy.remove(session.contactId) else {
+                    hiddenBy.add(session.contactId)
+                    lastSeen.remove(session.contactId) // don't keep what they asked us not to show
+                }
+                savePresence()
+                markPresenceKnown(session)
+                publishPresence()
             }
             Wire.Ping -> session.send(Wire.Pong)
             Wire.Pong -> Unit
@@ -826,6 +954,11 @@ class Node(
             if (sessions[session.contactId] === session) sessions.remove(session.contactId)
             sessions[session.contactId]
         }
+        if (current == null) {
+            offlineSince[session.contactId] = clock()
+            recordLastSeen(session)
+            savePresence()
+        }
         publishOnline()
         val pending = synchronized(session) {
             session.ended = true
@@ -850,6 +983,70 @@ class Node(
 
     private fun publishOnline() {
         _online.value = synchronized(sessionsLock) { sessions.keys.toSet() }
+        publishPresence()
+    }
+
+    // ---------------------------------------------------------------- presence
+
+    private fun hidingFrom(contact: Contact) = hideFromEveryone || contact.hideMyStatus
+
+    private fun isHidden(contactId: String): Boolean {
+        val contact = contact(contactId) ?: return true
+        return hidingFrom(contact) || contactId in hiddenBy
+    }
+
+    private fun sendPresence(session: Session) {
+        val contact = contact(session.contactId) ?: return
+        runCatching { session.send(Wire.Presence(show = !hidingFrom(contact))) }
+    }
+
+    private fun recordLastSeen(session: Session) {
+        if (!isHidden(session.contactId)) lastSeen[session.contactId] = session.lastHeardAt
+    }
+
+    private fun savePresence() {
+        runCatching { store.savePresence(PresenceState(lastSeen.toMap(), hiddenBy.toSet())) }
+            .onFailure { log("Could not save presence", it) }
+    }
+
+    private fun publishPresence() {
+        val live = synchronized(sessionsLock) { HashMap(sessions) }
+        _presence.value = _contacts.value.associate { contact ->
+            val hidden = isHidden(contact.id)
+            val session = live[contact.id]
+            contact.id to PeerPresence(
+                online = !hidden && session != null && session.presenceKnown,
+                lastSeen = if (hidden) null else lastSeen[contact.id],
+                hidden = hidden,
+            )
+        }
+    }
+
+    private fun markPresenceKnown(session: Session) {
+        synchronized(session) {
+            if (session.presenceKnown) return
+            session.presenceKnown = true
+        }
+        publishPresence()
+        if (session.arrival && contact(session.contactId)?.notifyOnline == true) {
+            wake(config.onlineAlertDelayMs + 5_000) // so a sleeping phone still shows the alert
+            scope.launch { maybeAlertOnline(session) }
+        }
+    }
+
+    /** "Alice is online" — only for a real arrival, never a flaky reconnect or our own restart. */
+    private suspend fun maybeAlertOnline(session: Session) {
+        delay(config.onlineAlertDelayMs)
+        val id = session.contactId
+        val contact = contact(id) ?: return
+        val now = clock()
+        val stillHere = hasSession(id) // a quick reconnect replacing this connection still counts
+        val wasAway = session.awaySince?.let { session.createdAt - it >= config.onlineAlertMinOfflineMs } ?: true
+        val notTooOften = lastAlertAt[id]?.let { now - it >= config.onlineAlertIntervalMs } ?: true
+        if (contact.notifyOnline && stillHere && !isHidden(id) && session.createdAt >= quietUntil && wasAway && notTooOften) {
+            lastAlertAt[id] = now
+            _cameOnline.tryEmit(id)
+        }
     }
 
     // ---------------------------------------------------------------- messages
@@ -876,7 +1073,7 @@ class Node(
             store.appendMessage(message)
             conversation.update { it + message }
         }
-        if (!message.outgoing) updateUnread(message.contactId)
+        updateSummary(message.contactId)
         return true
     }
 
@@ -898,14 +1095,19 @@ class Node(
                 list.map { if (it.id == id && it.outgoing == outgoing) it.copy(status = status) else it }
             }
         }
-        if (!outgoing) updateUnread(contactId)
+        updateSummary(contactId)
     }
 
-    private fun updateUnread(contactId: String) {
-        val count = if (contact(contactId) == null) 0 else {
-            conversation(contactId).value.count { !it.outgoing && it.status == MessageStatus.RECEIVED }
+    private fun updateSummary(contactId: String) {
+        if (contact(contactId) == null) {
+            _unread.update { it - contactId }
+            _summaries.update { it - contactId }
+            return
         }
+        val messages = conversation(contactId).value
+        val count = messages.count { !it.outgoing && it.status == MessageStatus.RECEIVED }
         _unread.update { if (count == 0) it - contactId else it + (contactId to count) }
+        _summaries.update { it + (contactId to ChatSummary(count, messages.lastOrNull())) }
     }
 
     private fun newMessageId() = Hex.encode(SecureRandomHolder.bytes(16))

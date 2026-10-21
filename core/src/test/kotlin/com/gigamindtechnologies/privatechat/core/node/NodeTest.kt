@@ -8,6 +8,10 @@ import com.gigamindtechnologies.privatechat.core.store.Identity
 import com.gigamindtechnologies.privatechat.core.store.MessageStatus
 import com.gigamindtechnologies.privatechat.core.store.SecureStore
 import com.gigamindtechnologies.privatechat.core.tor.OnionKey
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -21,6 +25,7 @@ import org.junit.rules.TemporaryFolder
 import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import javax.crypto.KeyGenerator
 
 class NodeTest {
@@ -230,7 +235,9 @@ class NodeTest {
 
         network.freezeAll() // Bob's network drops; Alice's end of the connection still looks fine
         await("bob notices") { bob.node.online.value.takeIf { it.isEmpty() } }
-        assertEquals(Node.SendResult.QUEUED, runBlocking { bob.node.sendText(aliceId, "after the network switch") })
+        // Usually QUEUED; SENT if Bob already redialled in the meantime (he retries quickly).
+        val result = runBlocking { bob.node.sendText(aliceId, "after the network switch") }
+        assertTrue(result == Node.SendResult.QUEUED || result == Node.SendResult.SENT)
         // Bob's new connection must replace Alice's dead one long before her 60 s timeout.
         await("delivered without waiting for Alice's timeout", timeoutMs = 15_000) {
             alice.node.messages(bobId).value.find { it.body == "after the network switch" }
@@ -394,5 +401,132 @@ class NodeTest {
         runBlocking { alice.node.sendText(bobId, "second") }
         val aliceId = bob.node.contacts.value.single().id
         await("second") { bob.node.messages(aliceId).value.find { it.body == "second" } }
+    }
+
+    private val presenceConfig = fastConfig.copy(
+        presenceGraceMs = 50,
+        onlineAlertDelayMs = 200,
+        onlineAlertQuietMs = 0,
+        onlineAlertMinOfflineMs = 0,
+        onlineAlertIntervalMs = 60_000,
+    )
+
+    private fun Phone.presenceOf(contactId: String) = node.presence.value[contactId]
+
+    @Test
+    fun onlineAndLastSeenAreKeptOnlyOnThePhone() {
+        val alice = phone("Alice", presenceConfig)
+        val bob = phone("Bob", presenceConfig)
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.presenceOf(aliceId)?.takeIf { it.online && !it.hidden } }
+
+        runBlocking { alice.node.sendText(bobId, "hi") }
+        val summary = await("summary") { bob.node.summaries.value[aliceId]?.takeIf { it.unread == 1 } }
+        assertEquals("hi", summary.last?.body)
+        assertEquals("hi", alice.node.summaries.value[bobId]?.last?.body)
+
+        alice.node.stop()
+        val gone = await("last seen") { bob.presenceOf(aliceId)?.takeIf { !it.online && it.lastSeen != null } }
+        assertTrue(gone.lastSeen!! <= System.currentTimeMillis())
+
+        // Bob restarts: "last seen" comes back from his encrypted files.
+        bob.node.stop()
+        val bob2 = phone("Bob", presenceConfig, store = bob.store)
+        assertEquals(gone.lastSeen, bob2.presenceOf(aliceId)?.lastSeen)
+        assertFalse(bob2.presenceOf(aliceId)!!.online)
+    }
+
+    @Test
+    fun hidingYourStatusAlsoHidesTheirs() {
+        val alice = phone("Alice", presenceConfig)
+        val bob = phone("Bob", presenceConfig)
+        pair(alice, bob)
+        val aliceId = bob.node.contacts.value.single().id
+        val bobId = alice.node.contacts.value.single().id
+        await("online") { bob.presenceOf(aliceId)?.takeIf { it.online } }
+
+        runBlocking { alice.node.setHideStatus(bobId, true) }
+        assertTrue(alice.node.contact(bobId)!!.hideMyStatus)
+        // Bob no longer sees Alice; like WhatsApp, Alice doesn't see Bob either.
+        await("hidden for bob") { bob.presenceOf(aliceId)?.takeIf { it.hidden && !it.online && it.lastSeen == null } }
+        assertTrue(alice.presenceOf(bobId)!!.hidden)
+        assertFalse(alice.presenceOf(bobId)!!.online)
+
+        alice.node.stop()
+        await("offline") { bob.node.online.value.takeIf { it.isEmpty() } }
+        assertNull(bob.presenceOf(aliceId)?.lastSeen) // nothing recorded while hidden
+
+        val alice2 = phone("Alice", presenceConfig, store = alice.store)
+        await("still hidden after restart") { bob.node.online.value.takeIf { aliceId in it } }
+        Thread.sleep(200)
+        assertTrue(bob.presenceOf(aliceId)!!.hidden)
+        assertTrue(alice2.node.contact(bobId)!!.hideMyStatus)
+
+        runBlocking { alice2.node.setHideStatus(bobId, false) }
+        await("visible again") { bob.presenceOf(aliceId)?.takeIf { it.online && !it.hidden } }
+        await("both ways") { alice2.presenceOf(bobId)?.takeIf { it.online && !it.hidden } }
+
+        alice2.node.setHideStatusFromEveryone(true)
+        await("hidden from everyone") { bob.presenceOf(aliceId)?.takeIf { it.hidden && !it.online } }
+        assertTrue(alice2.presenceOf(bobId)!!.hidden)
+        alice2.node.setHideStatusFromEveryone(false)
+        await("shown to everyone") { bob.presenceOf(aliceId)?.takeIf { it.online && !it.hidden } }
+    }
+
+    @Test
+    fun alertsWhenAContactComesOnlineOnlyIfAsked() {
+        val alice = phone("Alice", presenceConfig)
+        val bob = phone("Bob", presenceConfig)
+        val alerts = CopyOnWriteArrayList<String>()
+        val watcher = CoroutineScope(Dispatchers.IO)
+        watcher.launch { bob.node.cameOnline.collect { alerts += it } }
+        try {
+            pair(alice, bob)
+            val aliceId = bob.node.contacts.value.single().id
+            await("online") { bob.presenceOf(aliceId)?.takeIf { it.online } }
+            Thread.sleep(400)
+            assertTrue("no alert unless switched on", alerts.isEmpty())
+
+            runBlocking { bob.node.setNotifyOnline(aliceId, true) }
+            assertTrue(bob.node.contact(aliceId)!!.notifyOnline)
+            alice.node.stop()
+            await("offline") { bob.node.online.value.takeIf { it.isEmpty() } }
+            val alice2 = phone("Alice", presenceConfig, store = alice.store)
+            await("alert") { alerts.takeIf { it == listOf(aliceId) } }
+
+            // Comes and goes again soon after: no second alert within the interval.
+            alice2.node.stop()
+            await("offline again") { bob.node.online.value.takeIf { it.isEmpty() } }
+            phone("Alice", presenceConfig, store = alice.store)
+            await("online again") { bob.presenceOf(aliceId)?.takeIf { it.online } }
+            Thread.sleep(400)
+            assertEquals(listOf(aliceId), alerts.toList())
+        } finally {
+            watcher.cancel()
+        }
+    }
+
+    @Test
+    fun noOnlineAlertsRightAfterStartingOrWhileHidden() {
+        val alice = phone("Alice", presenceConfig)
+        val bob = phone("Bob", presenceConfig.copy(onlineAlertQuietMs = 60_000))
+        val alerts = CopyOnWriteArrayList<String>()
+        val watcher = CoroutineScope(Dispatchers.IO)
+        watcher.launch { bob.node.cameOnline.collect { alerts += it } }
+        try {
+            pair(alice, bob)
+            val aliceId = bob.node.contacts.value.single().id
+            runBlocking { bob.node.setNotifyOnline(aliceId, true) }
+            alice.node.stop()
+            await("offline") { bob.node.online.value.takeIf { it.isEmpty() } }
+            phone("Alice", presenceConfig, store = alice.store)
+            await("online") { bob.presenceOf(aliceId)?.takeIf { it.online } }
+            Thread.sleep(400)
+            assertTrue("Bob's app just started: everyone seems to come online", alerts.isEmpty())
+        } finally {
+            watcher.cancel()
+        }
     }
 }

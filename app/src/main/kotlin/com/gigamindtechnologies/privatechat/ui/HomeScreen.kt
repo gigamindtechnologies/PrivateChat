@@ -30,10 +30,14 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.gigamindtechnologies.privatechat.AppGraph
@@ -41,6 +45,7 @@ import com.gigamindtechnologies.privatechat.R
 import com.gigamindtechnologies.privatechat.TorStatus
 import com.gigamindtechnologies.privatechat.core.node.Node
 import com.gigamindtechnologies.privatechat.core.store.Contact
+import com.gigamindtechnologies.privatechat.core.store.MessageStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -55,13 +60,29 @@ fun HomeScreen(
     onSettings: () -> Unit,
     onRetryTor: () -> Unit,
 ) {
-    // Until Tor is up there is no engine yet, but contacts can still be listed from the encrypted files.
-    val stored by produceState(emptyList<Contact>(), graph) {
-        value = withContext(Dispatchers.IO) { runCatching { graph.store.loadContacts() }.getOrDefault(emptyList()) }
+    // Until Tor is up there is no engine yet, but chats can still be listed from the encrypted files.
+    val stored by produceState(emptyList<Contact>() to emptyMap<String, Node.ChatSummary>(), graph) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val contacts = graph.store.loadContacts()
+                contacts to contacts.associate { contact ->
+                    val messages = graph.store.loadMessages(contact.id)
+                    contact.id to Node.ChatSummary(
+                        messages.count { !it.outgoing && it.status == MessageStatus.RECEIVED },
+                        messages.lastOrNull(),
+                    )
+                }
+            }.getOrDefault(emptyList<Contact>() to emptyMap())
+        }
     }
-    val contacts = node?.contacts?.collectAsStateWithLifecycle()?.value ?: stored
-    val online = node?.online?.collectAsStateWithLifecycle()?.value ?: emptySet()
-    val unread = node?.unread?.collectAsStateWithLifecycle()?.value ?: emptyMap()
+    val contacts = node?.contacts?.collectAsStateWithLifecycle()?.value ?: stored.first
+    val summaries = node?.summaries?.collectAsStateWithLifecycle()?.value ?: stored.second
+    val presence = node?.presence?.collectAsStateWithLifecycle()?.value ?: emptyMap()
+    val showReadTicks by graph.readReceipts.collectAsStateWithLifecycle()
+    // Most recent conversation first, like WhatsApp; new contacts without messages by when they were added.
+    val sorted = remember(contacts, summaries) {
+        contacts.sortedByDescending { summaries[it.id]?.last?.timestamp ?: it.addedAt }
+    }
 
     Scaffold(
         topBar = {
@@ -98,22 +119,13 @@ fun HomeScreen(
                 EmptyContacts()
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(contacts.sortedBy { it.name.lowercase() }, key = { it.id }) { contact ->
-                        val isOnline = contact.id in online
-                        ListItem(
-                            headlineContent = { Text(contact.name) },
-                            supportingContent = {
-                                Text(
-                                    if (isOnline) "Online" else "Offline",
-                                    color = if (isOnline) OnlineGreen else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            },
-                            leadingContent = { Avatar(contact.name, isOnline) },
-                            trailingContent = {
-                                val count = unread[contact.id] ?: 0
-                                if (count > 0) Badge { Text(if (count > 99) "99+" else count.toString()) }
-                            },
-                            modifier = Modifier.clickable { onOpenChat(contact.id) },
+                    items(sorted, key = { it.id }) { contact ->
+                        ChatRow(
+                            contact = contact,
+                            summary = summaries[contact.id],
+                            online = presence[contact.id]?.online == true,
+                            showReadTicks = showReadTicks,
+                            onClick = { onOpenChat(contact.id) },
                         )
                         HorizontalDivider()
                     }
@@ -121,6 +133,46 @@ fun HomeScreen(
             }
         }
     }
+}
+
+@Composable
+private fun ChatRow(contact: Contact, summary: Node.ChatSummary?, online: Boolean, showReadTicks: Boolean, onClick: () -> Unit) {
+    val last = summary?.last
+    val unread = summary?.unread ?: 0
+    ListItem(
+        headlineContent = { Text(contact.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        supportingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (last?.outgoing == true) {
+                    Ticks(last.status, showReadTicks)
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(
+                    last?.body?.replace('\n', ' ') ?: if (online) "Online" else "Say hello 👋",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = if (unread > 0) FontWeight.SemiBold else null,
+                    color = if (unread > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        leadingContent = { Avatar(contact.name, online) },
+        trailingContent = {
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (last != null) {
+                    Text(
+                        chatListTime(last.timestamp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (unread > 0) ReadGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (unread > 0) {
+                    Badge(containerColor = ReadGreen, contentColor = Color.White) { Text(if (unread > 99) "99+" else unread.toString()) }
+                }
+            }
+        },
+        modifier = Modifier.clickable(onClick = onClick),
+    )
 }
 
 @Composable

@@ -18,7 +18,9 @@ Source references are relative to the repository root.
 
 - Messages are only delivered while both phones are online. There is no store-and-forward.
 - A compromised phone (malware, root, a forensic tool on an unlocked device) defeats everything.
-- Contacts can see when you are online, because they can connect to you.
+- Contacts can see when you are online, because they can connect to you. "Hide my online status"
+  only asks their app not to show it (see [Presence](#presence)); a modified app could ignore that,
+  and ticks still show when a message reached your phone.
 - An adversary watching both ends of the Tor network at once may correlate traffic timing.
   This is a general Tor limitation.
 - No independent audit yet.
@@ -108,6 +110,37 @@ Alice shows a code; Bob scans it.
 Every connection after that uses Noise IK between the permanent static keys over the
 contacts-only onion services.
 
+## Presence
+
+- Right after each handshake, both sides send `Presence{show}` (and again whenever the setting
+  changes). `show=false` means "don't show when I'm online or last seen". It is false when the
+  user hides their status from everyone or from that contact.
+- Reciprocity, like WhatsApp: if either side hides, neither app shows the other's status.
+  This is enforced by each app locally; it is not a cryptographic guarantee.
+- "Online" means a live, authenticated connection whose presence setting has arrived (or 3 s
+  passed, for older versions that don't send one). "Last seen" is the time this phone last
+  received anything from the contact. It is computed and stored only on this phone, in
+  `presence.bin`, and is deleted when the contact hides their status.
+- "… is online" alerts are opt-in per contact. To avoid false alarms they fire only when the
+  connection has lasted 20 s, the contact had been gone for at least 5 minutes (measured from
+  when this phone noticed they were gone, so our own sleep doesn't count), not within 2 minutes
+  of our app or network restarting, and at most once every 30 minutes per contact.
+
+## App lock
+
+- The PIN (4–12 digits) is stored only as a salted PBKDF2-HMAC-SHA256 hash (16-byte salt, 25,000
+  iterations) in `lock.bin` inside the vault (`core/.../store/PinLock.kt`). Anyone able to read
+  that file could already read the messages, so the lock's job is to stop someone holding an
+  unlocked phone; it does not encrypt data with the PIN.
+- After 5 wrong PINs each try waits 30 s, doubling up to 15 minutes. The counter is kept in the
+  vault, so restarting the app doesn't reset it.
+- The PIN pad is drawn by the app, so keyboard apps never see the PIN.
+- Fingerprint unlock uses Android's `BiometricPrompt` with `BIOMETRIC_STRONG` (Android 11+;
+  Android 10 uses the platform default). The PIN always works too.
+- The app locks when it leaves the screen (immediately, or after 1 or 5 minutes). While locked,
+  the conversation UI is not composed, so nothing is marked as read. The service keeps
+  receiving messages.
+
 ## Storage
 
 - Files live in `noBackupFilesDir/vault`. `identity.bin` and `contacts.bin` are sealed blobs
@@ -115,7 +148,7 @@ contacts-only onion services.
   individually sealed records, so a crash mid-write loses at most the last record
   (`core/.../store/SecureStore.kt`).
 - Sealing is AES-256-GCM with a random IV and a purpose label as associated data
-  (`identity`, `contacts`, `messages:<contactId>`), so files cannot be swapped.
+  (`identity`, `contacts`, `messages:<contactId>`, `presence`, `lock`), so files cannot be swapped.
 - The data key is wrapped by a non-exportable Android Keystore key (`app/.../security/VaultKey.kt`).
   The Keystore key is not bound to device unlock, so messages can still be received while the
   screen is locked. "Delete everything" removes the files and the Keystore key.
@@ -124,7 +157,8 @@ contacts-only onion services.
 
 - `FLAG_SECURE` on the activity: no screenshots or screen recording, and the app is blank in recent apps.
 - `allowBackup=false` plus data-extraction rules that exclude every domain.
-- Notifications contain no names or message text, only the number of unread messages.
+- Message notifications contain no names or message text, only the number of unread messages.
+  The opt-in "… is online" alert names the contact, with a lock-screen version that doesn't.
 - Release builds log nothing. Debug logs never include names, addresses or message contents.
 - No analytics, crash reporting, advertising, Firebase or Google Play services. QR decoding is
   ZXing on the device.
@@ -134,7 +168,7 @@ contacts-only onion services.
 
 - Periodic rekeying within long-lived connections (Noise `Rekey()`), for post-compromise
   security within a session.
-- App lock (PIN or biometrics) and a duress PIN that wipes the vault.
+- A duress PIN that wipes the vault.
 - Optionally bind the Keystore key to user authentication.
 - Tor `ExtendedErrors` in the app, to tell users *why* a contact can't be reached.
 - Reproducible builds and an external audit.

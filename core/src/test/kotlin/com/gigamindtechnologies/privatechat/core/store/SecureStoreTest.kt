@@ -96,4 +96,42 @@ class SecureStoreTest {
         assertFalse(dir.exists())
         assertNull(store.loadIdentity())
     }
+
+    @Test
+    fun presenceAndAppLockRoundTripEncrypted() {
+        val dir = tmp.newFolder()
+        val store = SecureStore(dir, sealer)
+        assertEquals(PresenceState(), store.loadPresence())
+        assertNull(store.loadAppLock())
+        store.savePresence(PresenceState(mapOf("0123456789abcdef" to 42L), setOf("fedcba9876543210")))
+        val lock = PinLock.create("2580", biometric = true)
+        store.saveAppLock(lock)
+        val reopened = SecureStore(dir, sealer)
+        assertEquals(42L, reopened.loadPresence().lastSeen["0123456789abcdef"])
+        assertEquals(setOf("fedcba9876543210"), reopened.loadPresence().hiddenBy)
+        assertEquals(lock, reopened.loadAppLock())
+        reopened.saveAppLock(null)
+        assertNull(SecureStore(dir, sealer).loadAppLock())
+    }
+
+    @Test
+    fun pinLockChecksPinsAndSlowsDownGuessing() {
+        val lock = PinLock.create("123456")
+        assertTrue(PinLock.matches("123456", lock))
+        assertFalse(PinLock.matches("123457", lock))
+        assertFalse(PinLock.matches("12a456", lock))
+        assertFalse(PinLock.isValid("123"))
+        assertFalse(PinLock.isValid("1234567890123"))
+        // Same PIN, different salt: the stored hashes differ.
+        assertFalse(lock.hash == PinLock.create("123456").hash)
+
+        var state = lock
+        repeat(4) { state = PinLock.failed(state, now = 1_000) }
+        assertEquals(0L, state.blockedUntil - 1_000)
+        state = PinLock.failed(state, now = 1_000)
+        assertEquals(30_000L, state.blockedUntil - 1_000)
+        state = PinLock.failed(state, now = 1_000)
+        assertEquals(60_000L, state.blockedUntil - 1_000)
+        assertEquals(15 * 60_000L, PinLock.delayAfter(100))
+    }
 }

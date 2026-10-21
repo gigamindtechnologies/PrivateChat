@@ -21,6 +21,12 @@ while your friend is offline waits on *your* phone and goes out as soon as they 
    server, because there is no server.
 4. **Ticks, like WhatsApp:** 🕓 waiting on your phone · ✓ sent · ✓✓ delivered to their phone ·
    green ✓✓ read. Read receipts can be turned off in Settings (then you don't see theirs either).
+5. **Online and last seen, like WhatsApp.** A chat shows "online" or "last seen today at 10:42".
+   "Last seen" is worked out and stored only on your phone. Hide your status from everyone
+   (Settings → Privacy) or from one person (chat menu); then you don't see theirs either.
+   In a chat's menu, **Tell me when … is online** sends you a notification when they come online.
+6. **App lock.** Settings → App lock asks for a PIN (or fingerprint) whenever the app is opened.
+   Messages keep arriving while it is locked.
 
 ## Privacy features
 
@@ -38,7 +44,9 @@ while your friend is offline waits on *your* phone and goes out as soon as they 
 | Encrypted storage, key in Android Keystore | A copied phone backup or file dump is unreadable |
 | No cloud backups | Nothing is copied to Google |
 | Screenshots blocked, app hidden in recent apps | Other apps and onlookers can't capture your chats |
-| Notifications say only "N new messages" | Your lock screen never shows names or text |
+| Message notifications say only "N new messages" | Your lock screen never shows names or text |
+| "Last seen" is stored only on your phone, and can be hidden | No server keeps a record of when you were online |
+| App lock with PIN or fingerprint | Someone holding your unlocked phone can't open your chats. The PIN pad is drawn by the app, so no keyboard app sees it |
 | Removing a contact removes it on both phones | They can no longer reach or find you |
 | Delete everything | Wipes identity, contacts, messages and destroys the encryption key |
 | No analytics, ads, crash reporting or Google services | Nothing reports on how you use the app |
@@ -58,6 +66,13 @@ while your friend is offline waits on *your* phone and goes out as soon as they 
 - **Connecting takes a few seconds.** Tor starts in about 10–30 seconds, and pairing usually
   takes 10–60 seconds.
 - **Android only for now.** iPhones don't allow apps to stay reachable in the background.
+- **Hiding your online status** hides "online" and "last seen". As on WhatsApp, ticks still show
+  when a message has reached a phone. Hiding relies on your contact's app respecting it.
+- **"… is online" alerts** name the contact, but not on the lock screen. They wait about 20
+  seconds, only come if the person was away for at least 5 minutes, and at most once every 30
+  minutes, so a shaky connection doesn't flood you.
+- **If you forget your app lock PIN**, the only way back in is to uninstall the app, which deletes
+  your messages and contacts. After 5 wrong PINs, each further try waits longer (up to 15 minutes).
 - **Your name is only shared at pairing.** If you change it later, existing contacts keep the
   old one (they can rename you on their phone).
 - **If you lose your phone or delete the app**, your identity and messages are gone. There is
@@ -127,7 +142,11 @@ a code, the pairing request with matching safety symbols, chatting both ways wit
 receipts, and the contact going offline. A second run covered ticks up to green "read",
 "N new messages" notifications while the app is in the background, unread counts, messages
 waiting (🕓) while the contact is offline and then delivered automatically, recovery after Android
-kills the app, and going back online by itself after a reboot. The first run found a bug the JVM
+kills the app, and going back online by itself after a reboot. A third run covered "online" and
+"last seen today at …" in the chat header, a contact hiding and showing their status (both
+directions), the "… is online" notification and opening the chat from it, the chat list with the
+latest message, and the app lock (locking when the app is left, messages arriving while locked,
+wrong and right PIN). The first run found a bug the JVM
 tests could not: on Android,
 `InetAddress.getLoopbackAddress()` is `::1`, so Tor (which forwards to `127.0.0.1`) could not
 reach the app. The engine now binds to `127.0.0.1` explicitly, and `core` tests run with
@@ -135,7 +154,8 @@ reach the app. The engine now binds to `127.0.0.1` explicitly, and `core` tests 
 
 ## Roadmap ideas
 
-- App lock with PIN or fingerprint, plus a "panic PIN" that wipes everything
+- A "panic PIN" that wipes everything
+- Voice messages
 - Disappearing messages
 - Sending photos and files (directly between phones, like messages)
 - Group chats (each message sent to each member directly)

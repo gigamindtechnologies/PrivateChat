@@ -15,6 +15,14 @@ sealed class Wire {
     @SerialName("ack")
     data class Ack(val id: String) : Wire()
 
+    /**
+     * First message of every connection (and again when the setting changes): whether the sender
+     * allows the receiver to show when they are online and last seen. Older versions ignore it.
+     */
+    @Serializable
+    @SerialName("pres")
+    data class Presence(val show: Boolean) : Wire()
+
     /** "I have read these messages of yours." Only sent if read receipts are on. */
     @Serializable
     @SerialName("read")
